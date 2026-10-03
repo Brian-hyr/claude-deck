@@ -1,0 +1,51 @@
+# Dependências e artefatos reconstruíveis
+node_modules/
+dist/
+coverage/
+.vite/
+.vitest/
+*.tsbuildinfo
+
+# Dados locais do Deck e credenciais (nunca versionar uma instalação)
+.claude/
+.ssh/
+.env
+.env.*
+*.pem
+*.p12
+*.pfx
+*.key
+.npmrc
+/browser-profile*/
+/browser.json
+/token
+/settings.json
+/state.json
+/sessions.json
+/hosts.json
+/history-cache.json
+/server.log
+
+# Relatórios de teste e capturas: alguns registram ambientes reais
+/test/shots/
+/test/.deck-browser-check-*/
+/test/fixtures/stream-probe.ndjson
+
+# Anotações privadas de desenvolvimento mantidas somente nesta máquina
+/CLAUDE.md
+/docs/PROGRESSO.md
+/docs/PLANO-COPIA-ENTRE-SERVIDORES.md
+/_diag-handshake.mjs
+/_handshake-out.txt
+
+# Monitor semanal de novidades do Claude Code (tarefa local pessoal)
+/launcher/check-claude-updates.*
+/launcher/register-update-monitor.ps1
+/scripts/monitor-claude-updates.mjs
+/test/e2e/update-monitor.mjs
+
+# Saídas locais (a fixture sintética abaixo é necessária para os testes)
+*.log
+!/test/fixtures/sandbox/data/log-grande.log
+*.tmp
+*.tmp.*

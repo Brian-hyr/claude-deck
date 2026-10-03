@@ -1,0 +1,4 @@
+{"tipo":"login","usuario":"usuario","quando":"2026-09-29T08:00:00Z"}
+{"tipo":"mensagem","usuario":"usuario","texto":"olá","tokens":12}
+{"tipo":"ferramenta","nome":"Edit","arquivo":"src/app.ts","ok":true}
+{"tipo":"logout","usuario":"usuario","quando":"2026-09-29T09:00:00Z"}

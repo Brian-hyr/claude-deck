@@ -1,0 +1,14 @@
+{
+  "nome": "Claude Deck",
+  "versao": "1.0.0",
+  "ativo": true,
+  "limite": null,
+  "servidores": [
+    { "alias": "srv-linux-1", "porta": 22, "favorito": true, "pastas": ["/home/usuario/app", "/home/usuario/api"] },
+    { "alias": "srv-linux-2", "porta": 2222, "favorito": true, "pastas": ["/home/usuario/worker"] },
+    { "alias": "srv-linux-3", "porta": 22, "favorito": false, "pastas": [] }
+  ],
+  "tema": { "cor": "#1f1f1f", "fonte": 13, "acentos": ["ação", "configuração", "memória"] },
+  "numeros": { "inteiro": 42, "decimal": 3.14159, "negativo": -7, "grande": 12345678901234 },
+  "texto_longo": "Este é um texto mais longo para ver como o visualizador lida com strings extensas sem quebrar o layout da árvore JSON."
+}

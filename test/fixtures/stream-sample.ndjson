@@ -1,0 +1,17 @@
+{"type":"user","uuid":"8fff4e0c-16ef-44b6-b3fa-450d5ef076cb","message":{"id":"msg-u1","role":"user","content":[{"type":"text","text":"Reply with exactly: hello deck"}]}}
+{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello deck"}}}
+{"type":"stream_event","event":{"type":"content_block_stop","index":0}}
+{"type":"assistant","uuid":"msg-a1","message":{"id":"msg-a1","role":"assistant","content":[{"type":"text","text":"hello deck"}]}}
+{"type":"result","subtype":"success","uuid":"res-1"}
+{"type":"user","uuid":"user-2","message":{"id":"msg-u2","role":"user","content":[{"type":"text","text":"Count to 10"}]}}
+{"type":"assistant","uuid":"msg-a2","message":{"id":"msg-a2","role":"assistant","content":[{"type":"text","text":"1 2 3"}]}}
+{"type":"user","uuid":"user-interrupted","message":{"id":"msg-u-int","role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}
+{"type":"result","subtype":"interrupted","uuid":"res-2"}
+{"type":"user","uuid":"user-3","message":{"id":"msg-u3","role":"user","content":[{"type":"text","text":"Run shell command"}]}}
+{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-tool-1","name":"PowerShell","input":{}}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"echo probe-ok\"}"}}}
+{"type":"stream_event","event":{"type":"content_block_stop","index":0}}
+{"type":"assistant","uuid":"msg-a3","message":{"id":"msg-a3","role":"assistant","content":[{"type":"tool_use","id":"call-tool-1","name":"PowerShell","input":{"command":"echo probe-ok"}}]}}
+{"type":"user","uuid":"user-tool-res","message":{"id":"msg-u-tool","role":"user","content":[{"type":"tool_result","tool_use_id":"call-tool-1","content":"probe-ok"}]}}
+{"type":"result","subtype":"success","uuid":"res-3"}

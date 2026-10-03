@@ -1,0 +1,120 @@
+/* Cores do highlight.js alinhadas ao tema do VS Code (escuro e claro). */
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-built_in,
+.hljs-type {
+  color: #569cd6;
+}
+.hljs-keyword {
+  color: #c586c0;
+}
+.hljs-literal,
+.hljs-symbol {
+  color: #569cd6;
+}
+.hljs-string,
+.hljs-attr-value,
+.hljs-template-tag,
+.hljs-template-variable,
+.hljs-addition {
+  color: #ce9178;
+}
+.hljs-number {
+  color: #b5cea8;
+}
+.hljs-comment,
+.hljs-quote {
+  color: #6a9955;
+  font-style: italic;
+}
+.hljs-title,
+.hljs-title.function_,
+.hljs-section {
+  color: #dcdcaa;
+}
+.hljs-title.class_,
+.hljs-class .hljs-title {
+  color: #4ec9b0;
+}
+.hljs-attr,
+.hljs-attribute,
+.hljs-variable,
+.hljs-params,
+.hljs-property {
+  color: #9cdcfe;
+}
+.hljs-tag,
+.hljs-name {
+  color: #569cd6;
+}
+.hljs-meta {
+  color: #9b9b9b;
+}
+.hljs-regexp {
+  color: #d16969;
+}
+.hljs-deletion {
+  color: #f48771;
+}
+.hljs-emphasis {
+  font-style: italic;
+}
+.hljs-strong {
+  font-weight: bold;
+}
+.hljs-link {
+  color: #4daafc;
+  text-decoration: underline;
+}
+
+[data-theme='light'] .hljs-keyword {
+  color: #af00db;
+}
+[data-theme='light'] .hljs-literal,
+[data-theme='light'] .hljs-symbol,
+[data-theme='light'] .hljs-built_in,
+[data-theme='light'] .hljs-type,
+[data-theme='light'] .hljs-tag,
+[data-theme='light'] .hljs-name {
+  color: #0000ff;
+}
+[data-theme='light'] .hljs-string,
+[data-theme='light'] .hljs-addition {
+  color: #a31515;
+}
+[data-theme='light'] .hljs-number {
+  color: #098658;
+}
+[data-theme='light'] .hljs-comment {
+  color: #008000;
+}
+[data-theme='light'] .hljs-title,
+[data-theme='light'] .hljs-title.function_ {
+  color: #795e26;
+}
+[data-theme='light'] .hljs-title.class_ {
+  color: #267f99;
+}
+[data-theme='light'] .hljs-attr,
+[data-theme='light'] .hljs-attribute,
+[data-theme='light'] .hljs-variable,
+[data-theme='light'] .hljs-params,
+[data-theme='light'] .hljs-property {
+  color: #001080;
+}
+
+/* Caminhos de arquivo clicáveis no chat. */
+.md code.path-link {
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+.md code.path-link:hover {
+  color: var(--link);
+}
+.md.streaming > :last-child::after {
+  content: '▋';
+  color: var(--claude);
+  animation: pulse 1s infinite;
+  margin-left: 2px;
+}
