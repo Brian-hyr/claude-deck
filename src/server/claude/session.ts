@@ -9,7 +9,7 @@ import type { Store } from '../config';
 import { readJson, writeJsonAtomic } from '../config';
 import { LocalTransport, RemoteTransport, type Transport, type EndReason } from './transport';
 import { shq } from '../fs/hostfs';
-import { DeckError } from '../../shared/protocol';
+import { DeckError, isSyntheticBreadcrumb } from '../../shared/protocol';
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, TerminalMcpServer, type ToolResult } from '../terminal/mcp';
 import { describeResult, type TerminalAgent } from '../terminal/agent';
 import {
@@ -605,6 +605,9 @@ export class ClaudeSession extends EventEmitter {
     } catch {
       return;
     }
+    // Ecos e breadcrumbs sintéticos do CLI (ex.: ao trocar modelo via set_model):
+    // não representam mensagens reais do usuário nem iniciam turnos de trabalho.
+    if (isSyntheticBreadcrumb(msg)) return;
     // Reanexou e a saída voltou a fluir: não espera a resposta do "initialize" (o CLI só responde
     // no fim do turno em andamento) para mostrar que está trabalhando.
     // (O que o usuário mandar continua na fila até o "initialize" provar que o processo está vivo.)
@@ -952,7 +955,7 @@ export class ClaudeSession extends EventEmitter {
     if (this.transport?.alive && this.state.phase !== 'reconnecting') {
       await this.control({ subtype: 'set_model', model: model ?? 'default' });
     }
-    this.setState({ model: model ?? this.state.model });
+    this.setState({ model: model || undefined });
   }
 
   /** O CLI aceita --effort ao iniciar, mas não há controle stream-json para trocá-lo em execução. */

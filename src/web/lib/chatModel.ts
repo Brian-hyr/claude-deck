@@ -2,6 +2,7 @@
 // do transcript) numa lista de itens para a tela. Puro (sem DOM), testado à parte.
 import { markCacheCompacted, recordCacheFrame, type PromptCacheRecord } from './promptCache';
 import { EMPTY_CONTEXT, isCompactCommand, usedTokensOf, windowFromModelUsage, type AutoCompactInfo, type ContextUsageState } from './contextUsage';
+import { isSyntheticBreadcrumb } from '../../shared/protocol';
 
 export type ToolStatus = 'running' | 'done' | 'error' | 'denied' | 'interrupted';
 
@@ -923,6 +924,7 @@ export class ChatModel {
       return;
     }
     if (parentId) return;
+    if (isSyntheticBreadcrumb(msg)) return;
     let { text, images, command } = visibleUserText(content);
     if (/^\[Request interrupted by user/i.test(text)) {
       this.endTurnTools(true);

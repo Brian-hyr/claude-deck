@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { ChatModel, costIncreases, formatSentAt, groupChatItems, isSubstantialText, msgTime, parsePartialJson, textRoles, totalInput, visibleUserText, type Item, type ResultItem, type ToolItem } from '../../src/web/lib/chatModel';
+import { isSyntheticBreadcrumb } from '../../src/shared/protocol';
 import { formatTokens } from '../../src/web/lib/format';
 
 const fixture = fs
@@ -670,5 +671,25 @@ describe('agentes em execução (indicador ao lado do modelo)', () => {
     m.apply(launch('t1', { description: 'Abandonado', run_in_background: true }, oldTime), { history: true });
     m.apply(back('t1', { status: 'async_launched', agentId: 'agent-1' }), { history: true });
     expect(m.runningAgents(0)).toEqual([]);
+  });
+
+  it('isSyntheticBreadcrumb identifica breadcrumbs do CLI como troca de modelo', () => {
+    expect(isSyntheticBreadcrumb({ type: 'user', message: { role: 'user', content: '<local-command-stdout>Set model to `sonnet`</local-command-stdout>' }, isReplay: true })).toBe(true);
+    expect(isSyntheticBreadcrumb({ type: 'user', isMeta: true, message: { role: 'user', content: 'meta' } })).toBe(true);
+    expect(isSyntheticBreadcrumb({ type: 'user', message: { role: 'user', content: '<command-name>model</command-name>\n<local-command-stdout>Set model to `flash`</local-command-stdout>' } })).toBe(true);
+    expect(isSyntheticBreadcrumb({ type: 'user', message: { role: 'user', content: 'Olá, altere o modelo do projeto' } })).toBe(false);
+  });
+
+  it('eco de troca de modelo não vira mensagem no chat e não deixa o modelo rodando', () => {
+    const m = new ChatModel();
+    const breadcrumb = {
+      type: 'user',
+      message: { role: 'user', content: '<local-command-stdout>Set model to `claude-3-5-sonnet`</local-command-stdout>' },
+      isReplay: true,
+      uuid: 'crumb-1',
+    };
+    m.apply(breadcrumb);
+    expect(m.running).toBe(false);
+    expect(m.items).toHaveLength(0);
   });
 });

@@ -401,6 +401,14 @@ rl.on('line', (line) => {
       out({ type: 'system', subtype: 'status', status: null, permissionMode: mode, session_id: sessionId, uuid: crypto.randomUUID() });
     } else if (r.subtype === 'set_model') {
       model = r.model || 'fake-sonnet';
+      out({
+        type: 'user',
+        message: { role: 'user', content: `<local-command-stdout>Set model to \`${model}\`</local-command-stdout>` },
+        session_id: sessionId,
+        parent_tool_use_id: null,
+        uuid: crypto.randomUUID(),
+        isReplay: true,
+      });
       out({ type: 'control_response', response: { subtype: 'success', request_id: m.request_id, response: {} } });
     } else if (r.subtype === 'get_settings') {
       out({ type: 'control_response', response: { subtype: 'success', request_id: m.request_id, response: { lastPermissions } } });

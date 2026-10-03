@@ -42,3 +42,28 @@ export class DeckError extends Error {
     this.code = code;
   }
 }
+
+/**
+ * Detecta se uma mensagem `user` é um eco/breadcrumb sintético gerado pelo CLI
+ * (ex.: ao trocar o modelo via set_model: "<local-command-stdout>Set model to `...`</local-command-stdout>").
+ * Essas mensagens não são pedidos reais do usuário e nunca geram um turno ou resposta de assistente.
+ */
+export function isSyntheticBreadcrumb(msg: any): boolean {
+  if (!msg || msg.type !== 'user') return false;
+  if (msg.isMeta) return true;
+  const content = msg.message?.content;
+  let text = '';
+  if (typeof content === 'string') text = content;
+  else if (Array.isArray(content)) {
+    for (const b of content) {
+      if (b?.type === 'text' && typeof b.text === 'string') text += (text ? '\n' : '') + b.text;
+    }
+  }
+  if (!text) return false;
+  if (/<local-command-stdout>[\s\S]*?<\/local-command-stdout>/.test(text)) {
+    const stripped = text.replace(/<[^>]+>[\s\S]*?<\/[^>]+>/g, '').trim();
+    if (!stripped) return true;
+  }
+  return false;
+}
+
