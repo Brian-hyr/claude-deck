@@ -19,8 +19,7 @@ Abaixo está o comparativo técnico detalhado das vantagens do Claude Deck em re
 | **Restauração de Sessões** | Foco na última pasta aberta | **Restaura todas as janelas e abas** que estavam abertas ao ligar o PC |
 | **Terminal ao Vivo + Interação MCP** | Terminal e IA desacoplados em abas separadas | **Terminal ao Vivo nativo lado a lado**, com MCP interativo em tempo real |
 | **Agilidade no Terminal** | Atalhos tradicionais de IDE | **Auto-cópia ao selecionar texto** e **colar com botão direito** |
-| **Visibilidade de Contexto** | Indicador oculto ou básico | **Pizza de contexto permanente**, com threshold de auto-compactação |
-| **Comando `/compact`** | Digitar comando no prompt | **1 clique na pizza** (enfileira se o modelo estiver ocupado) |
+| **Controle de Contexto e `/compact`** | Nativo na extensão da IDE | **Mesma paridade visual**, mas sem a sobrecarga de memória da IDE |
 | **Compatibilidade de Histórico** | Padrão Claude Code | **100% idêntico**: lê e grava em `~/.claude/projects` |
 
 ---
@@ -49,9 +48,9 @@ Abaixo está o comparativo técnico detalhado das vantagens do Claude Deck em re
 - O modo **Terminal ao Vivo** expõe ferramentas MCP seguras que permitem ao Claude interagir diretamente com o shell da máquina, sessões SSH aninhadas, ou CLIs de equipamentos e serviços de rede, enquanto você assiste à execução na tela em tempo real.
 - Suporta **cópia instantânea ao selecionar com o mouse** e **colagem imediata com o clique direito**, acelerando o fluxo de trabalho diário.
 
-### 📊 6. Monitoramento e Controle de Contexto Sem Fricção
-- Uma "pizza" de uso de contexto sempre visível no canto inferior mostra exatamente quanto da janela do modelo já foi consumido e onde está configurado o threshold de compactação automática.
-- Clicar na pizza executa `/compact` diretamente. Se o Claude estiver no meio de uma resposta, o comando é colocado na fila com segurança para rodar assim que o turno terminar.
+### 📊 6. Paridade Completa de Contexto e Compactação
+- O Claude Deck reproduz fielmente a "pizza" de uso de contexto e a compactação com 1 clique da extensão oficial, mostrando a porcentagem consumida e o threshold de auto-compactação.
+- Oferece a mesma conveniência e tranquilidade visual da extensão, mas em uma interface enxuta que não disputa recursos com seu trabalho.
 
 ### 🔄 7. Compatibilidade Total e Sem Lock-in
 - O Claude Deck não inventa formatos proprietários: ele lê e grava nos arquivos JSONL padrão do Claude Code em `~/.claude/projects`.

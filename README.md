@@ -21,7 +21,7 @@ O Claude Deck foi criado para quem quer o poder do Claude Code sem o peso e as l
 | **Restauração de sessões** | Restaura apenas a última pasta | **Restaura todas as janelas e abas** ao ligar o PC |
 | **Terminal ao Vivo** | Desacoplado da IA em outra aba | **Terminal nativo lado a lado com MCP em tempo real** |
 | **Agilidade de terminal** | Teclas padrão de IDE | **Auto-cópia ao selecionar** e **colar com botão direito** |
-| **Uso de contexto e `/compact`** | Indicador básico | **Pizza de contexto sempre visível**, compacta com 1 clique |
+| **Controle de contexto e `/compact`** | Nativo na extensão da IDE | **Mesma paridade visual**, mas sem a sobrecarga da IDE |
 | **Histórico e ecossistema** | Padrão Claude Code | **100% compatível**: lê e grava em `~/.claude/projects` |
 
 > 📖 Para a análise técnica aprofundada de cada ponto, consulte o documento [Vantagens e Comparativo Técnico](docs/VANTAGENS.md).
