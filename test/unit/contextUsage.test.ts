@@ -14,6 +14,12 @@ import {
   pieStroke,
   usedTokensOf,
   windowFromModelUsage,
+  parseDetailedContextUsage,
+  shortenPath,
+  colorForCategory,
+  CONTEXT_CATEGORY_COLORS,
+  contextPercent,
+  visibleContextCategories,
 } from '../../src/web/lib/contextUsage';
 
 describe('contextUsage: funções puras', () => {
@@ -60,18 +66,18 @@ describe('contextUsage: funções puras', () => {
       '28% restante da janela útil do modelo.',
       'Janela do modelo: 100k tokens (menos a reserva para a resposta e para o compactador).',
       'Compactação automática: o Claude ainda não informou o valor configurado.',
-      'Clique para compactar agora (/compact).',
+      'Clique para ver o detalhamento (/context).',
     ]);
-    expect(contextAriaLabel(m)).toBe('72% do contexto usado — clique para compactar');
+    expect(contextAriaLabel(m)).toBe('72% do contexto usado — clique para ver o detalhamento');
     const full = contextMeter({ usedTokens: 999_999, contextWindow: 100_000, maxOutputTokens: 4_000 })!;
     expect(contextTooltip(full)).toContain('0% restante da janela útil do modelo');
     // Janela ainda desconhecida: a pizza existe mesmo assim, e a dica diz o que falta saber.
     const none = contextUnknownTooltip({ usedTokens: 0, contextWindow: 0, maxOutputTokens: 0 });
     expect(none.split('\n')[0]).toBe('Contexto: ainda sem dados desta conversa.');
     expect(none).toContain('aparecem quando o próximo turno terminar');
-    expect(none.split('\n').at(-1)).toBe('Clique para compactar agora (/compact).');
+    expect(none.split('\n').at(-1)).toBe('Clique para ver o detalhamento (/context).');
     expect(contextUnknownTooltip({ usedTokens: 305_191, contextWindow: 0, maxOutputTokens: 0 }).split('\n')[0]).toBe('Contexto: 305k tokens em uso.');
-    expect(contextAriaLabel(undefined)).toBe('Uso do contexto ainda desconhecido — clique para compactar');
+    expect(contextAriaLabel(undefined)).toBe('Uso do contexto ainda desconhecido — clique para ver o detalhamento');
   });
 
   it('pieStroke: contorno proporcional, com limites', () => {
@@ -170,9 +176,9 @@ describe('contextUsage: compactação automática definida pelo usuário', () =>
       '35% restante até a compactação automática.',
       'Janela do modelo: 1M tokens.',
       'Compactação automática: definida em 500k (variável de ambiente). Compacta em 467k, já descontada a reserva para a resposta e para o compactador.',
-      'Clique para compactar agora (/compact).',
+      'Clique para ver o detalhamento (/context).',
     ]);
-    expect(contextAriaLabel(m)).toBe('65% do limite de compactação automática usado — clique para compactar');
+    expect(contextAriaLabel(m)).toBe('65% do limite de compactação automática usado — clique para ver o detalhamento');
     const viaSettings = contextMeter({ usedTokens: 1, contextWindow: 1_000_000, maxOutputTokens: 64_000, autoCompact: { enabled: true, window: 400_000, threshold: 367_000, source: 'settings' } })!;
     expect(contextTooltip(viaSettings)).toContain('definida em 400k (configurações do Claude Code)');
     // Padrão do Claude Code (sem o usuário ter definido nada): não finge que foi escolha dele.
@@ -335,18 +341,12 @@ describe('contextUsage: /compact na fila enquanto o Claude trabalha', () => {
     expect(compactAction(false, 'started')).toBe('compact');
   });
 
-  it('a dica e o rótulo acessível dizem o que o clique faz em cada situação', () => {
+  it('a pizza abre o detalhamento, sem compactar ao clicar', () => {
     const meter = contextMeter({ usedTokens: 100_000, contextWindow: 1_000_000, maxOutputTokens: 64_000 })!;
-    expect(contextTooltip(meter).split('\n').at(-1)).toBe('Clique para compactar agora (/compact).');
-    expect(contextTooltip(meter, 'enqueue').split('\n').at(-1)).toBe('O Claude está trabalhando. Clique para deixar o /compact na fila: ele roda quando o Claude terminar.');
-    expect(contextTooltip(meter, 'queued').split('\n').at(-1)).toBe('/compact na fila: roda quando o Claude terminar o que está fazendo.');
-    expect(contextTooltip(meter, 'compacting').split('\n').at(-1)).toBe('Compactando agora.');
-    expect(contextUnknownTooltip(EMPTY, 'queued').split('\n').at(-1)).toBe('/compact na fila: roda quando o Claude terminar o que está fazendo.');
-    expect(contextAriaLabel(meter, 'enqueue')).toBe('10% do contexto usado — clique para deixar a compactação na fila');
-    expect(contextAriaLabel(meter, 'queued')).toBe('10% do contexto usado — compactação na fila');
-    expect(contextAriaLabel(undefined, 'compacting')).toBe('Uso do contexto ainda desconhecido — compactando');
-    // Sem o argumento continua como era.
-    expect(contextAriaLabel(meter)).toBe('10% do contexto usado — clique para compactar');
+    expect(contextTooltip(meter).split('\n').at(-1)).toBe('Clique para ver o detalhamento (/context).');
+    expect(contextUnknownTooltip(EMPTY).split('\n').at(-1)).toBe('Clique para ver o detalhamento (/context).');
+    expect(contextAriaLabel(meter)).toBe('10% do contexto usado — clique para ver o detalhamento');
+    expect(contextAriaLabel(undefined)).toBe('Uso do contexto ainda desconhecido — clique para ver o detalhamento');
   });
 
   it('ChatModel.compactState: na fila até o eco do CLI, compactando até o fim do turno, depois nada', () => {
@@ -387,5 +387,74 @@ describe('contextUsage: /compact na fila enquanto o Claude trabalha', () => {
     expect(m.compactState()).toBe('queued');
     m.apply(echo(second));
     expect(m.compactState()).toBe('started');
+  });
+});
+
+describe('contextUsage: detalhamento do modal e formatadores', () => {
+  it('shortenPath encurta pastas home em macOS, Linux e Windows para ~', () => {
+    expect(shortenPath('/Users/usuario/.claude/CLAUDE.md')).toBe('~/.claude/CLAUDE.md');
+    expect(shortenPath('/home/usuario/repo/CLAUDE.md')).toBe('~/repo/CLAUDE.md');
+    expect(shortenPath('/root/.claude/rules.md')).toBe('~/.claude/rules.md');
+    expect(shortenPath('C:\\Users\\usuario\\AppData\\Roaming\\claude.json')).toBe('~\\AppData\\Roaming\\claude.json');
+    expect(shortenPath('/var/log/syslog')).toBe('/var/log/syslog');
+    expect(shortenPath('')).toBe('');
+  });
+
+  it('as categorias extras não reciclam cores e viram uma única categoria Outras', () => {
+    expect(colorForCategory(0)).toBe(CONTEXT_CATEGORY_COLORS[0]);
+    expect(colorForCategory(CONTEXT_CATEGORY_COLORS.length)).toBe('var(--fg-muted)');
+    const categories = Array.from({ length: 10 }, (_, i) => ({ name: `Categoria ${i}`, tokens: 100 }));
+    expect(visibleContextCategories([...categories, { name: 'Free space', tokens: 1000 }, { name: 'Deferred', tokens: 25, isDeferred: true }])).toEqual([
+      ...categories.slice(0, 7), { name: 'Outras categorias', tokens: 300 },
+    ]);
+    expect(contextPercent(0, 1000)).toBe('0%');
+    expect(contextPercent(10, 10_000)).toBe('0,1%');
+    expect(contextPercent(1, 100_000)).toBe('<0,1%');
+  });
+
+  it('parseDetailedContextUsage interpreta resposta completa do Claude Code', () => {
+    const raw = {
+      model: 'claude-sonnet-4-5',
+      totalTokens: 45210,
+      rawMaxTokens: 200000,
+      percentage: 23,
+      categories: [
+        { name: 'System prompt', tokens: 8200 },
+        { name: 'System tools', tokens: 12000 },
+        { name: 'Free space', tokens: 154790 },
+      ],
+      memoryFiles: [{ path: '/home/usuario/.claude/CLAUDE.md', tokens: 1200 }],
+      agents: [{ agentType: 'Explore', tokens: 3400 }],
+    };
+
+    const parsed = parseDetailedContextUsage(raw);
+    expect(parsed).toBeDefined();
+    expect(parsed?.model).toBe('claude-sonnet-4-5');
+    expect(parsed?.totalTokens).toBe(45210);
+    expect(parsed?.rawMaxTokens).toBe(200000);
+    expect(parsed?.percentage).toBe(23);
+    expect(parsed?.categories).toHaveLength(3);
+    expect(parsed?.memoryFiles[0]).toEqual({ path: '/home/usuario/.claude/CLAUDE.md', tokens: 1200 });
+    expect(parsed?.agents[0]).toEqual({ agentType: 'Explore', tokens: 3400 });
+  });
+
+  it('parseDetailedContextUsage calcula percentage se ausente e tolera campos vazios', () => {
+    const raw = {
+      usedTokens: 50000,
+      maxTokens: 100000,
+    };
+    const parsed = parseDetailedContextUsage(raw);
+    expect(parsed).toBeDefined();
+    expect(parsed?.percentage).toBe(50);
+    expect(parsed?.categories).toEqual([]);
+    expect(parsed?.memoryFiles).toEqual([]);
+    expect(parsed?.agents).toEqual([]);
+  });
+
+  it('parseDetailedContextUsage retorna undefined para entradas inválidas', () => {
+    expect(parseDetailedContextUsage(null)).toBeUndefined();
+    expect(parseDetailedContextUsage(undefined)).toBeUndefined();
+    expect(parseDetailedContextUsage('invalido')).toBeUndefined();
+    expect(parseDetailedContextUsage({ totalTokens: 100, rawMaxTokens: 0 })).toBeUndefined();
   });
 });

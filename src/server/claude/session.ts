@@ -131,6 +131,8 @@ export class ClaudeSession extends EventEmitter {
   private starting: Promise<void> | null = null;
   private closing = false;
   private detaching = false;
+  /** Sobe a cada `park()`: reanexos que já estavam a caminho percebem que foram cancelados. */
+  private parkSeq = 0;
   private lastInit: BufferedMsg | null = null;
   private resultsSeen = 0;
   private startedAt = 0;
@@ -513,11 +515,14 @@ export class ClaudeSession extends EventEmitter {
     const delays = [500, 1500, 3000, 6000, 10000, 20000, 30000];
     const d = delays[Math.min(this.reconnectAttempt, delays.length - 1)];
     this.reconnectAttempt++;
+    const seq = this.parkSeq;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
+      if (seq !== this.parkSeq) return; // soltada (park) enquanto esperava
       this.reattach().catch((e) => {
         this.mgr.log(`[${this.state.hostId}] reanexar ${this.state.sid.slice(0, 8)} falhou: ${(e as Error).message}`);
         if (e instanceof DeckError && e.code === 'missing') return;
+        if (seq !== this.parkSeq) return;
         this.scheduleReattach();
       });
     }, d);
@@ -538,13 +543,22 @@ export class ClaudeSession extends EventEmitter {
     if (!this.isRemote || !this.state.runnerId) return;
     if (this.transport?.alive) return;
     if (this.starting) return;
+    const seq = this.parkSeq;
     this.setPhase('reconnecting');
     await this.mgr.registry.connect(this.state.hostId);
     await this.mgr.registry.ensureRunner(this.state.hostId);
+    // Soltada (park) enquanto conectava: quem soltou não quer a conexão de volta sozinha.
+    if (seq !== this.parkSeq) return;
     this.awaitingInit = true;
     let init: any = null;
     try {
       await this.attachRemote();
+      if (seq !== this.parkSeq) {
+        const t = this.transport;
+        this.transport = null;
+        t?.close();
+        return;
+      }
       // Se o runner não existe mais, o transporte termina com 'missing' e vira "adormecida".
       init = await this.control(this.initRequest(), 30_000).catch(() => null);
     } finally {
@@ -690,6 +704,7 @@ export class ClaudeSession extends EventEmitter {
     } else if (msg.type === 'stream_event' || msg.type === 'assistant') {
       if (this.state.phase === 'idle') this.setPhase('running');
     } else if (msg.type === 'result') {
+      if (!msg.timestamp) msg.timestamp = new Date().toISOString();
       this.resultsSeen++;
       this.turnOffset = this.offset;
       // IDs e offset são salvos na mesma escrita atômica. Turnos concluídos não são relidos.
@@ -958,15 +973,42 @@ export class ClaudeSession extends EventEmitter {
     this.setState({ model: model || undefined });
   }
 
-  /** O CLI aceita --effort ao iniciar, mas não há controle stream-json para trocá-lo em execução. */
+  /** Processo de pé e já inicializado, sem reconectar nem reiniciar: dá para falar com o CLI agora. */
+  private get canControlLive() {
+    return !!this.transport?.alive && this.gotInitialize && !this.awaitingInit && !this.starting && !this.reattaching && !this.effortChange && ['idle', 'running'].includes(this.state.phase);
+  }
+
+  /**
+   * Troca o esforço da conversa. Com o processo de pé, o CLI aplica na hora (`apply_flag_settings`): vale a
+   * partir da próxima chamada ao modelo, inclusive no meio de uma tarefa, sem reiniciar nada. Um CLI antigo,
+   * sem esse pedido, cai no caminho de antes (reiniciar com --effort e --resume), possível só entre tarefas.
+   * `null` volta ao padrão do modelo.
+   */
   async setEffort(effort: EffortLevel | null) {
     if (effort !== null && !EFFORT_LEVELS.includes(effort)) throw new DeckError('bad', 'Nível de esforço inválido.');
-    if (this.effortChange || this.starting || this.reattaching || this.inTurn || this.pendingPermissions.size || this.outbox.length || !['idle', 'dormant'].includes(this.state.phase))
-      throw new DeckError('busy', 'Espere o Claude terminar a tarefa antes de mudar o esforço.');
-    if (this.isRemote && this.state.runnerId && !this.runnerEnded && !this.transport?.alive)
-      throw new DeckError('busy', 'Aguarde esta conversa reconectar ao servidor antes de mudar o esforço.');
+    if (this.effortChange) throw new DeckError('busy', 'Aguarde a mudança de esforço anterior terminar.');
     const next = effort ?? undefined;
     if (next === this.state.effort) return;
+    let liveUnsupported = false;
+    if (this.canControlLive) {
+      try {
+        await this.control({ subtype: 'apply_flag_settings', settings: { effortLevel: effort } }, 15_000);
+        this.setState({ effort: next }); // O próximo --resume (reinício, retomada) já sobe com este esforço.
+        this.mgr.persistNow(); // Já aplicado no CLI: falha de disco só vai ao log, não desfaz nem finge que não aplicou.
+        return;
+      } catch (e) {
+        const err = e as DeckError;
+        if (err.code === 'control' && /unsupported/i.test(err.message)) liveUnsupported = true;
+        else if (err.code !== 'notrunning') throw new DeckError('effort', `Não apliquei o nível de esforço: ${err.message}`);
+        // CLI antigo ou processo que acabou de cair: segue para o caminho que reinicia, se for possível.
+      }
+    }
+    if (this.starting || this.reattaching || this.inTurn || this.pendingPermissions.size || this.outbox.length || !['idle', 'dormant'].includes(this.state.phase))
+      throw new DeckError('busy', liveUnsupported
+        ? 'Este Claude Code é antigo demais para trocar o esforço durante a tarefa. Espere ela terminar (ou atualize o Claude Code).'
+        : 'Espere o Claude terminar de conectar antes de mudar o esforço.');
+    if (this.isRemote && this.state.runnerId && !this.runnerEnded && !this.transport?.alive)
+      throw new DeckError('busy', 'Aguarde esta conversa reconectar ao servidor antes de mudar o esforço.');
     const change = this.changeEffort(next);
     this.effortChange = change;
     try {
@@ -1072,6 +1114,40 @@ export class ClaudeSession extends EventEmitter {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.transport?.close();
+  }
+
+  /**
+   * Solta o canal desta conversa com o servidor SEM mexer no Claude de lá (o runner segue rodando). Fica
+   * "pausada" (`dormant`) e só volta quando alguém a usa: mensagem nova ou a janela dela reaberta
+   * (`sessions.reattach`). Ao contrário de uma queda de rede, nada tenta reconectar sozinho — é o que permite
+   * fechar a conexão SSH do servidor de verdade. Um turno em andamento continua no servidor e é retomado do
+   * ponto onde parou (mesmo caminho da reconexão depois de uma queda). Devolve se soltou algo.
+   */
+  park(): boolean {
+    if (!this.isRemote || !this.state.runnerId || this.closing || this.detaching || this.starting) return false;
+    if (!this.transport && !this.reconnectTimer && !this.reattaching) return false; // nada ligado
+    this.parkSeq++;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.reconnectAttempt = 0;
+    this.termMcp.abortAll();
+    for (const [id, c] of this.controls) {
+      clearTimeout(c.timer);
+      c.reject(new DeckError('parked', 'A conversa foi desconectada do servidor.'));
+      this.controls.delete(id);
+    }
+    const t = this.transport;
+    this.transport = null; // antes de fechar: o fim do canal não vale como queda (ver o handler de 'end')
+    t?.close();
+    // Direto no estado (não por setPhase): o relógio de um turno em andamento tem de sobreviver, como numa conversa "pausada".
+    this.setState({ phase: 'dormant', error: undefined });
+    return true;
+  }
+
+  /** Solta só se a conversa está parada: sem turno, sem pedido de permissão, sem mensagem na fila. */
+  parkIfIdle(): boolean {
+    if (this.state.phase !== 'idle' || this.inTurn || this.pendingPermissions.size || this.outbox.length || !this.transport?.alive) return false;
+    return this.park();
   }
 
   get alive() {
@@ -1275,7 +1351,11 @@ export class SessionManager extends EventEmitter {
   /** O título automático (ai-title) é gravado pelo CLI alguns segundos depois do 1º turno. */
   scheduleTitleRefresh(s: ClaudeSession) {
     const run = () => {
-      if (this.sessions.get(s.state.sid) === s) this.refreshTitle(s).catch(() => {});
+      if (this.sessions.get(s.state.sid) !== s) return;
+      // Tarefa de fundo: ler o transcript abriria a conexão SSH de novo, até depois de você desconectar ou
+      // de a conexão ser solta. Servidor sem conexão fica para quando conectar (evento 'status' → ensureTitle).
+      if (s.isRemote && this.registry.status(s.state.hostId).state !== 'ready') return;
+      this.refreshTitle(s).catch(() => {});
     };
     run();
     if (!s.state.title || s.titleFromPrompt || s.userTitle) {
@@ -1293,10 +1373,47 @@ export class SessionManager extends EventEmitter {
     }
   }
 
-  /** Reanexa as conversas remotas que ainda podem estar vivas no servidor. */
+  /**
+   * Solta o canal de todas as conversas remotas de um servidor, sem mexer no Claude de lá (ver `park`).
+   * `onlyIdle`: só as paradas (sem turno, permissão ou mensagem na fila). Devolve quantas soltou.
+   */
+  parkHost(hostId: string, onlyIdle = false): number {
+    let n = 0;
+    for (const s of this.sessions.values()) {
+      if (s.state.hostId !== hostId) continue;
+      if (onlyIdle ? s.parkIfIdle() : s.park()) n++;
+    }
+    if (n) this.persistSoon();
+    return n;
+  }
+
+  /**
+   * A janela fechou: solta as conversas dela que estão paradas. Devolve os servidores remotos que ela usava
+   * (soltando ou não), para quem chamou ver se a conexão deles ainda tem utilidade.
+   */
+  parkIdleOfWindow(wid: string): string[] {
+    const hosts = new Set<string>();
+    let n = 0;
+    for (const s of this.sessions.values()) {
+      if (s.state.wid !== wid || !s.isRemote) continue;
+      hosts.add(s.state.hostId);
+      if (s.parkIfIdle()) n++;
+    }
+    if (n) {
+      this.persistSoon();
+      this.log(`janela fechada: ${n} conversa(s) parada(s) soltaram o canal SSH`);
+    }
+    return [...hosts];
+  }
+
+  /**
+   * Reanexa as conversas remotas que ainda podem estar vivas no servidor: as pedidas (`sids`: as abas da janela
+   * que abriu) e as que estavam no meio de um turno, que precisam ser acompanhadas até o fim para avisar.
+   * Sem `sids` (interface antiga), todas, como antes.
+   */
   resumeRemote(sids?: string[]) {
     for (const s of this.sessions.values()) {
-      if (sids && !sids.includes(s.state.sid)) continue;
+      if (sids && !sids.includes(s.state.sid) && !s.state.turnStartedAt) continue;
       if (s.isRemote && s.state.runnerId && !s.runnerEnded && !s.alive && s.state.phase === 'dormant') {
         s.reattach().catch((e) => {
           this.log(`[${s.state.hostId}] conversa ${s.state.sid.slice(0, 8)} sem runner vivo: ${(e as Error).message}`);

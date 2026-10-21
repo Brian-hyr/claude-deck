@@ -114,6 +114,9 @@ await step('mensagem simples com streaming', async () => {
   await waitText('.result-line .result-tokens', '↑ 25,4k · ↓ 6 tokens');
   const tip = await page.$eval('.result-line .result-tokens', (e) => e.title);
   assert(tip.includes('Este turno') && tip.includes('25.088 lidos do cache') && tip.includes('Sessão inteira'), `dica dos tokens: ${tip}`);
+  assert((await count('.result-line .result-time')) >= 1, 'sem hora de chegada da resposta');
+  const timeTip = await page.$eval('.result-line .result-time', (e) => e.title);
+  assert(timeTip.length > 0, 'hora de chegada sem title com data completa');
   // Resposta simples (sem ferramenta): sem destaque de "resposta final".
   assert((await count('.msg-final')) === 0, 'resposta sem ferramentas não deveria ter o destaque de resposta final');
   assert((await count('.msg .msg-copy')) >= 1, 'resposta sem botão de copiar');
@@ -828,11 +831,27 @@ await step('Trocar o nível de esforço', async () => {
   await waitIdle();
 });
 
+await step('Trocar o nível de esforço no meio da tarefa vale na próxima ação', async () => {
+  await send('slowfx 40'); // ~4 s trabalhando
+  await page.waitForSelector('.send-btn.stop', { timeout: 8000 });
+  await page.click('.composer .pill-select[title="Modelo desta conversa"]');
+  await menu('Baixo');
+  await waitText('.toast', 'vale a partir da próxima ação');
+  await waitText('.composer .pill-select[title="Modelo desta conversa"]', 'Baixo');
+  await waitText('.msg .md', 'esforço-na-próxima-ação=low', 20000);
+  await waitIdle();
+  await send('effort');
+  await waitText('.msg .md', 'esforço=low', 20000);
+  await waitIdle();
+});
+
 await step('Uso do contexto', async () => {
   await page.click('.chat-header button[title="Mais"]');
   await menu('Uso do contexto');
-  await waitText('.toast', 'Contexto:');
-  await waitText('.toast', '6%');
+  await waitText('.context-modal .ctx-summary', 'tokens');
+  await waitText('.context-modal .ctx-name', 'System prompt');
+  await page.keyboard.press('Escape');
+  await waitFor(() => !document.querySelector('.context-modal'), 5000, 'modal fechado');
 });
 
 await step('Várias abas: Ctrl+N, Alt+1, Ctrl+Tab, renomear', async () => {
@@ -1335,13 +1354,39 @@ await step('Editar e salvar (Ctrl+S) + conflito com mudança externa', async () 
 });
 
 // ------------------------------------------------ explorador
-await step('Explorador: novo arquivo', async () => {
+await step('Explorador: novo arquivo (na pasta do item selecionado)', async () => {
+  // src/app.ts está selecionado: o botão do cabeçalho cria em src/, como no VS Code.
   await page.click('.section-head button[title="Novo arquivo"]');
   await page.waitForSelector('.tree-row input.rename', { timeout: 3000 });
   await page.keyboard.type('criado.md');
   await page.keyboard.press('Enter');
   await waitActiveFile('criado.md');
-  assert(exists('criado.md'), 'criado.md não existe no disco');
+  assert(exists('src', 'criado.md') && !exists('criado.md'), 'criado.md não foi criado em src/');
+});
+
+await step('Explorador: novo arquivo na raiz (clique no vazio) e pelo menu de um arquivo', async () => {
+  await page.click('.explorer-fill');
+  await page.click('.section-head button[title="Novo arquivo"]');
+  await page.waitForSelector('.tree-row input.rename', { timeout: 3000 });
+  await page.keyboard.type('raiz-e2e.md');
+  await page.keyboard.press('Enter');
+  await waitActiveFile('raiz-e2e.md');
+  assert(exists('raiz-e2e.md'), 'raiz-e2e.md não foi criado na raiz');
+  const row = await findTreeRow('config.json');
+  await row.click({ button: 'right' });
+  await menu('Novo arquivo nesta pasta');
+  await page.waitForSelector('.tree-row input.rename', { timeout: 3000 });
+  await page.keyboard.type('irmao-e2e.md');
+  await page.keyboard.press('Enter');
+  await waitActiveFile('irmao-e2e.md');
+  assert(exists('data', 'irmao-e2e.md'), 'irmao-e2e.md não foi criado em data/');
+  for (const name of ['raiz-e2e.md', 'irmao-e2e.md']) {
+    await (await findTreeRow(name)).click({ button: 'right' });
+    await menu('Apagar');
+    await clickText('.dialog .dialog-foot .btn', 'Apagar', true);
+    await waitText('.toast', `Apagado: ${name}`);
+  }
+  assert(!exists('raiz-e2e.md') && !exists('data', 'irmao-e2e.md'), 'arquivos de teste continuam no disco');
 });
 
 await step('Explorador: renomear', async () => {
@@ -1353,7 +1398,7 @@ await step('Explorador: renomear', async () => {
   await page.keyboard.type('renomeado.md');
   await page.keyboard.press('Enter');
   await findTreeRow('renomeado.md');
-  assert(exists('renomeado.md') && !exists('criado.md'), 'renomear não refletiu no disco');
+  assert(exists('src', 'renomeado.md') && !exists('src', 'criado.md'), 'renomear não refletiu no disco');
 });
 
 await step('Explorador: apagar (com confirmação)', async () => {
@@ -1363,7 +1408,7 @@ await step('Explorador: apagar (com confirmação)', async () => {
   await waitText('.dialog .dialog-head', 'Apagar renomeado.md?');
   await clickText('.dialog .dialog-foot .btn', 'Apagar', true);
   await waitText('.toast', 'Apagado: renomeado.md');
-  assert(!exists('renomeado.md'), 'arquivo continua no disco');
+  assert(!exists('src', 'renomeado.md'), 'arquivo continua no disco');
 });
 
 await step('Explorador: enviar arquivo (upload) e substituir', async () => {
@@ -2105,6 +2150,28 @@ await step('Restaura 3 conversas da pasta local após fechar a janela e reinicia
       await hb.waitIdle();
       otherWid = await other.evaluate(() => sessionStorage.getItem('deck.wid'));
       assert(otherWid !== projectWid, 'a outra pasta deveria ter janela independente');
+
+      await a.bringToFront();
+      await a.click('.chat-header button[title="Marcar como pendente de visualização"]');
+      await ha.waitFor(() => !!document.querySelector('.statusbar .sb-pending'), 5000, 'pendência só na pasta de origem');
+      await other.bringToFront();
+      await hb.waitFor(() => !document.querySelector('.activitybar .act-badge.pending'), 5000, 'sem contador da outra pasta');
+      assert(!(await other.title()).includes('🔖'), 'título da outra pasta mostrou a pendência');
+      assert(!(await other.$('.statusbar .sb-pending')), 'rodapé da outra pasta mostrou a pendência');
+      await other.click('.activitybar .act-btn[title^="Histórico"]');
+      await other.click('.sidebar .seg button:nth-child(3)');
+      await hb.waitText('.sidebar .tree-empty', 'Nenhuma conversa pendente nesta pasta.');
+      assert(!(await other.$('.sidebar .tree-row.history-pending')), 'Histórico misturou as duas pastas');
+      await other.evaluate(() => [...document.querySelectorAll('.sidebar .seg')].at(-1)?.querySelectorAll('button')[1]?.click());
+      await hb.waitFor(() => !!document.querySelector('.sidebar .tree-row.history-pending'), 10000, 'consulta explícita de todas as pastas');
+      await other.screenshot({ path: path.join(SHOTS, 'historico-pendentes-outra-pasta.png') });
+      await other.evaluate(() => [...document.querySelectorAll('.sidebar .seg button')].find((b) => b.textContent === 'Esta pasta')?.click());
+      await hb.waitFor(() => !document.querySelector('.sidebar .tree-row.history-pending'), 5000, 'retorno à pasta atual');
+      await other.reload({ waitUntil: 'networkidle2' });
+      await hb.waitFor(() => !document.querySelector('.activitybar .act-badge.pending'), 10000, 'contador isolado após F5');
+      await a.bringToFront();
+      await a.click('.chat-header button[title="Desmarcar pendência"]');
+      await ha.waitFor(() => !document.querySelector('.statusbar .sb-pending'), 5000, 'limpar pendência do teste');
       await a.close();
 
       const url = (await hb.rpc('window.open', { hostId: 'local', folder: e.sandbox })).url;

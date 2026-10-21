@@ -132,9 +132,24 @@ try {
 
     await page.evaluate(() => navigator.clipboard.writeText("Write-Output ('DECK_PASTE_' + (50 + 8))"));
     await page.mouse.click(row.x, row.y, { button: 'right' });
+    // A leitura da área de transferência é assíncrona: o Enter só vale depois do texto aparecer na linha de comando.
+    await h.waitFor(() => document.querySelector('.terminal-panel .xterm-rows')?.textContent.includes("'DECK_PASTE_' + (50 + 8)"), 10000, 'right-click paste to reach the command line');
     await page.focus('.terminal-panel .xterm-helper-textarea');
     await page.keyboard.press('Enter');
     await h.waitFor(() => document.querySelector('.terminal-panel .xterm-rows')?.textContent.includes('DECK_PASTE_58'), 10000, 'right-click pasted into the PTY');
+  });
+  await step('Ctrl+V pastes the clipboard text instead of sending ^V to the shell', async () => {
+    await page.evaluate(() => navigator.clipboard.writeText("Write-Output ('DECK_CTRLV_' + (60 + 1))"));
+    await page.focus('.terminal-panel .xterm-helper-textarea');
+    // `commands: ['paste']` faz o Chromium sem janela executar a colagem que o Ctrl+V faria numa janela de verdade.
+    await page.keyboard.down('Control');
+    await page.keyboard.down('KeyV', { commands: ['paste'] });
+    await page.keyboard.up('KeyV');
+    await page.keyboard.up('Control');
+    await h.waitFor(() => document.querySelector('.terminal-panel .xterm-rows')?.textContent.includes("'DECK_CTRLV_' + (60 + 1)"), 10000, 'Ctrl+V text to reach the command line');
+    h.assert(!(await terminalText()).includes('^V'), 'Ctrl+V was sent to the shell as ^V');
+    await page.keyboard.press('Enter');
+    await h.waitFor(() => document.querySelector('.terminal-panel .xterm-rows')?.textContent.includes('DECK_CTRLV_61'), 10000, 'Ctrl+V pasted command ran in the PTY');
   });
   h.assert(env.app.errors.length === 0, env.app.errors.join('\n'));
   console.log(`Live terminal browser checks: ${results.length} passed. Screenshot: ${path.join(shots, 'command-and-result.png')}`);

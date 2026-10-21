@@ -5,7 +5,9 @@ import { rpc } from '../lib/rpc';
 import {
   addHostDialog,
   chats,
+  claudeUpdateOffer,
   connectHost,
+  disconnectHost,
   errorText,
   folderBrowser,
   homeOf,
@@ -17,6 +19,8 @@ import {
   toast,
   toggleFavorite,
   hostLabel,
+  updateHostClaude,
+  updatingClaude,
   windowContext,
 } from '../lib/state';
 import type { HostInfo } from '../../shared/types';
@@ -25,7 +29,7 @@ import { openMenu } from './ContextMenu';
 import { tildify } from '../../shared/paths';
 
 const expandedHosts = signal<Set<string>>(new Set(['local']));
-const checkResults = signal<Record<string, { ok: boolean; ms: number; error?: string; claude?: { version: string } | null }>>({});
+const checkResults = signal<Record<string, { ok: boolean; ms: number; error?: string; claude?: { version: string } | null; claudeLatest?: string }>>({});
 const checking = signal(false);
 
 function stateIcon(id: string) {
@@ -123,7 +127,7 @@ function CheckTable() {
               </td>
               <td>{id}</td>
               <td style={{ color: 'var(--fg-muted)' }}>
-                {res[id].ok ? (res[id].claude ? `Claude ${res[id].claude!.version}` : 'sem Claude') : res[id].error}
+                {res[id].ok ? (res[id].claude ? `Claude ${res[id].claude!.version}${res[id].claudeLatest ? ` → ${res[id].claudeLatest} disponível` : ''}` : 'sem Claude') : res[id].error}
               </td>
             </tr>
           ))}
@@ -154,6 +158,8 @@ function HostRow({ host, chats: nChats, filterQ }: { host: HostInfo; chats: numb
   }, [host.recentFolders, qLower, host.label, host.address]);
 
   const startChat = (folder?: string) => openChatIn(host.id, folder);
+  const offer = claudeUpdateOffer(host.id);
+  const updating = updatingClaude.value.has(host.id);
   // Só o explorador desta janela mostra arquivos, e só do servidor dela: "Abrir pasta…" e
   // "Abrir no explorador" não aparecem para os outros servidores (eles têm a janela deles).
   const ctx = windowContext.value;
@@ -170,8 +176,11 @@ function HostRow({ host, chats: nChats, filterQ }: { host: HostInfo; chats: numb
         ? [
             { label: host.favorite ? 'Tirar dos favoritos' : 'Marcar como favorito', icon: host.favorite ? 'star-full' : 'star-empty', action: () => toggleFavorite(host.id) },
             { label: st?.state === 'ready' ? 'Reconectar' : 'Conectar', icon: 'plug', action: () => connectHost(host.id, true).catch(() => {}) },
+            ...(offer
+              ? [{ label: updating ? 'Atualizando o Claude Code…' : `Atualizar Claude Code (${offer.from} → ${offer.to})…`, icon: 'arrow-circle-up', disabled: updating, action: () => void updateHostClaude(host.id) }]
+              : []),
             ...(st?.state === 'ready'
-              ? [{ label: 'Desconectar', icon: 'debug-disconnect', action: () => rpc.call('hosts.disconnect', { id: host.id }) }]
+              ? [{ label: 'Desconectar', icon: 'debug-disconnect', action: () => void disconnectHost(host.id) }]
               : []),
             { separator: true },
             { label: 'Copiar comando ssh', icon: 'copy', action: () => navigator.clipboard.writeText(`ssh ${/\s/.test(host.id) ? `"${host.id}"` : host.id}`) },
@@ -198,6 +207,17 @@ function HostRow({ host, chats: nChats, filterQ }: { host: HostInfo; chats: numb
           <span class="desc" title={`${nChats} conversa(s) aberta(s)`}>
             <Icon name="comment" style={{ fontSize: 12 }} /> {nChats}
           </span>
+        )}
+        {offer && (
+          <button
+            class="icon-btn claude-update-btn"
+            style={{ color: 'var(--warn)' }}
+            disabled={updating}
+            title={`Claude Code ${offer.from} → ${offer.to}. Clique para atualizar este servidor.`}
+            onClick={(e) => (e.stopPropagation(), void updateHostClaude(host.id))}
+          >
+            <Icon name={updating ? 'loading' : 'arrow-circle-up'} class={updating ? 'spin' : ''} />
+          </button>
         )}
         {stateIcon(host.id)}
         <span class="actions">

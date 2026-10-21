@@ -86,6 +86,21 @@ describe('cópia gerenciada', () => {
     expect(() => manager.start('dest', { ...args, requestId: 'req2' })).toThrow();
     expect(() => manager.get('other', one.id)).toThrow();
   });
+  it('item arrastado de outra janela: copia da origem informada sem tocar no clipboard', async () => {
+    const before = manager.setClipboard('source', 'local', p('src'));
+    const args = { requestId: 'drag1', hostId: 'local', dir: p('dst'), source: { hostId: 'local', path: p('src', 'a.txt') } };
+    const one = manager.start('dest', args);
+    expect(manager.start('dest', args).id).toBe(one.id);
+    const j = await wait(one.id);
+    expect(j.state).toBe('completed'); expect(j.source.path).toBe(p('src', 'a.txt'));
+    expect(await fs.readFile(p('dst', 'a.txt'), 'utf8')).toBe('original\n');
+    expect(await fs.readFile(p('src', 'a.txt'), 'utf8')).toBe('original\n');
+    expect(manager.clipboard).toEqual(before);
+    // Mesmo pedido para outra origem não vira outra cópia; origem inválida é recusada antes de começar.
+    expect(() => manager.start('dest', { ...args, source: { hostId: 'local', path: p('src') } })).toThrow();
+    expect(() => manager.start('dest', { ...args, requestId: 'drag2', source: { hostId: 'local', path: 'relativo.txt' } })).toThrow();
+    expect(() => manager.start('dest', { ...args, requestId: 'drag3', source: null as any })).toThrow();
+  });
   it('destino surgido depois da análise não é sobrescrito', async () => {
     const originalStage = adapter.stage;
     adapter.stage = async (dest) => { await fs.writeFile(dest, 'chegou outro'); return originalStage(dest); };

@@ -128,7 +128,13 @@ Para que um colega instale e utilize o Claude Deck em seu próprio PC de forma l
 
 ### Marcar conversa para ver depois
 
-Na conversa, clique no ícone de marcador no cabeçalho ou use **Marcar como pendente de visualização** no menu da aba (botão direito) ou em **Mais**. No Histórico, o marcador de cada linha e o menu de contexto fazem o mesmo. A marca fica visível na aba, no Histórico e nos avisos, mesmo depois de fechar a aba; a seção **Histórico → Pendentes** reúne as conversas marcadas deste servidor, inclusive de outras pastas. O número no ícone do Histórico inclui as abas fechadas. A marca só some quando você **abrir a conversa novamente** (trocar para outra aba e voltar, ou retomar pelo Histórico); focar a janela, recarregar ou iniciar outro turno não apaga. Se marcar por engano, clique no marcador novamente para desmarcar. Conversas novas só podem ser marcadas depois de receberem um ID de sessão. Com servidor antigo ainda em execução, o Deck avisa que é preciso aguardar a atualização segura do daemon.
+Na conversa, clique no ícone de marcador no cabeçalho ou use **Marcar como pendente de visualização** no menu da aba (botão direito) ou em **Mais**. No Histórico, o marcador de cada linha e o menu de contexto fazem o mesmo. A marca fica visível na aba, no Histórico e nos avisos, mesmo depois de fechar a aba; o número no ícone do Histórico e a seção **Histórico → Pendentes** mostram por padrão só a pasta desta janela, inclusive abas fechadas. Dentro de **Pendentes**, escolha **Todas as pastas** para consultar as outras pastas do mesmo servidor sem confundir os alertas das janelas. A marca só some quando você **abrir a conversa novamente** (trocar para outra aba e voltar, ou retomar pelo Histórico); focar a janela, recarregar ou iniciar outro turno não apaga. Se marcar por engano, clique no marcador novamente para desmarcar. Conversas novas só podem ser marcadas depois de receberem um ID de sessão. Com servidor antigo ainda em execução, o Deck avisa que é preciso aguardar a atualização segura do daemon.
+
+### Fixar mensagem para voltar a ela
+
+Passe o mouse sobre uma mensagem, sua ou do Claude, e clique no alfinete (ao lado de copiar nas respostas; junto da hora nas suas mensagens). O botão de alfinete do cabeçalho da conversa mostra quantas estão fixadas e abre a lista; clicar numa linha **rola a conversa até a mensagem e a destaca por um instante**. Se ela estiver num trecho antigo ainda não carregado, o Deck carrega as páginas anteriores sozinho até achá-la. Para desafixar, clique de novo no alfinete da mensagem ou no ✕ da lista.
+
+É só leitura: fixar não escreve na caixa de mensagem, não manda nada ao Claude e não altera a conversa nem o transcript. As fixadas ficam gravadas por conversa (até 100) e voltam depois de recarregar a janela ou reiniciar o app. Só mensagens já confirmadas e respostas finalizadas podem ser fixadas (não vale texto no meio do trabalho, dentro de subagentes nem os cartões automáticos). Uma mensagem que sumiu da conversa, por exemplo por compactação, avisa que não foi encontrada. Com servidor antigo ainda em execução, o Deck avisa que é preciso aguardar a atualização segura do daemon.
 
 ## Explorador e busca
 
@@ -257,15 +263,23 @@ Na conversa, clique no ícone de marcador no cabeçalho ou use **Marcar como pen
   `CLAUDE_CODE_AUTO_COMPACT_WINDOW` ou configurações) e o limite em que o Claude compacta de fato
   (o valor definido menos a reserva para a resposta e a folga do compactador). O anel é a porcentagem
   desse limite, não da janela do modelo. O valor vem do próprio Claude da conversa (computador ou servidor
-  daquela aba), perguntado uma vez por processo, com a conversa à vista e o Claude parado. Clicar manda
-  `/compact` direto no chat, sem confirmação. Com o Claude trabalhando o clique **deixa o `/compact` na
-  fila** (como na extensão do VS Code): ele roda sozinho quando o turno termina, a pizza pulsa enquanto
-  espera e um segundo clique não enfileira outro. A janela do modelo só
-  é conhecida depois do primeiro turno terminado; antes disso a dica diz que ainda é desconhecida, mas o
-  clique continua valendo. Se o Claude Code da conversa for antigo e não informar a compactação
-  automática, a base volta a ser a janela do modelo e a dica avisa. A escolha do esforço
-  fica no mesmo menu do modelo e reinicia apenas o processo CLI daquela aba com `--effort`, mantendo
-  o mesmo transcript (`--resume`) sem mexer nas outras abas.
+  daquela aba), perguntado uma vez por processo, com a conversa à vista e o Claude parado. Clicar na
+  pizza ou digitar `/context` abre o detalhamento: barra segmentada por categoria, tokens e porcentagens,
+  arquivos de memória e agentes (quando o CLI os informa). O botão **Compactar agora (/compact)** é uma
+  ação separada: com o Claude trabalhando, deixa a compactação na fila; não permite enfileirar outra
+  enquanto uma já espera ou está rodando. A janela do modelo só é conhecida depois do primeiro turno
+  terminado; antes disso a dica diz que ainda é desconhecida, mas o clique continua valendo. Se o Claude
+  Code não fornecer a distribuição por categoria, o modal avisa em vez de inventar valores. Se o Claude
+  Code for antigo e não informar a compactação automática, a base volta a ser a janela do modelo.
+  A escolha do esforço
+  fica no mesmo menu do modelo e vale na hora, até no meio de uma tarefa: o Claude Code aplica na
+  próxima chamada ao modelo (`apply_flag_settings`), sem reiniciar nem interromper e sem mexer nas outras
+  abas. Num Claude Code antigo, que não conhece esse pedido, o Deck reinicia só o processo daquela aba
+  com `--effort` e `--resume` (mesmo transcript), possível apenas entre tarefas.
+  A troca de **modelo** durante uma tarefa depende da versão do Claude Code instalada: na 2.1.289 (a da
+  extensão do VS Code) vale já na próxima chamada ao modelo, no meio da tarefa; na 2.1.205 a tarefa termina
+  no modelo antigo e o novo vale a partir da próxima mensagem. Quem quiser o comportamento da extensão
+  precisa de um Claude Code atualizado no computador ou servidor da conversa.
 - **Modelo padrão** (Configurações): menu com todos os modelos que o Claude Code informou neste
   computador e nos servidores, sem repetir. A lista fica guardada e aparece já ao abrir o app;
   modelos que só existem em alguns servidores são indicados abaixo do menu.
@@ -285,6 +299,16 @@ Na conversa, clique no ícone de marcador no cabeçalho ou use **Marcar como pen
 - Servidores com senha: o app pergunta na hora. A senha fica só na memória, até fechar o app.
 - **Uma conexão por servidor**, com um canal por conversa e SFTP para arquivos. Se o servidor
   limitar os canais, o app abre outra conexão sozinho.
+- **Fechar a última aba de um servidor fecha a conexão SSH** (conversa ou terminal, pelo botão de
+  fechar, depois de uns 10 segundos). Enquanto houver outra conversa ou terminal dele, uma cópia ou
+  um download em andamento, a conexão continua. Ao usar o servidor de novo (explorador, histórico,
+  nova conversa) o app reconecta sozinho; servidores que pedem código a cada login pedem de novo.
+- **Fechar a janela solta as conversas paradas dela**, e com elas a conexão do servidor se mais nada
+  a usa. A conversa continua no servidor e volta quando você reabre a janela ou manda uma mensagem.
+  As que estão trabalhando seguem ligadas para avisar quando terminam.
+- **Desconectar** (aba Servidores) de fato desconecta: as conversas do servidor ficam pausadas, sem
+  reconectar sozinhas, e voltam quando você manda uma mensagem. Se alguma está trabalhando, o app
+  pergunta antes, porque o que ela escrever só aparece ao reconectar.
 - **As conversas remotas sobrevivem a quedas.** No servidor, o Claude roda desligado da conexão,
   por um script pequeno em `~/.cache/claude-deck`. Esse script é instalado só quando você abre a
   primeira conversa naquele servidor. Se a rede cair, o notebook dormir ou o app reiniciar, o app
@@ -298,6 +322,22 @@ Na conversa, clique no ícone de marcador no cabeçalho ou use **Marcar como pen
   outra janela leva a conversa para a janela daquela pasta. A setinha só mostra/esconde as pastas;
   *Abrir no explorador* e *Abrir pasta…* só mostram os arquivos, sem mudar a pasta das conversas,
   e só aparecem no servidor desta janela. A busca também acha pelas pastas recentes.
+- **Claude Code do servidor desatualizado: o Deck avisa e atualiza com um clique.** Ao conectar, o
+  Deck compara a versão do `claude` do servidor com a mais nova publicada no npm (a consulta sai do
+  seu computador, sem custo no servidor). Se o servidor está atrás, a barra de status mostra
+  **Claude 2.1.205 → 2.1.293 · Atualizar** (também há um ícone na linha do servidor, o item *Atualizar
+  Claude Code…* no menu dele e a versão nova na tabela do *Testar todos*). O clique pede confirmação
+  e roda `claude update` no servidor, o comando oficial, que escolhe sozinho entre instalador nativo e
+  npm; o Deck confere a versão depois e mostra o resultado. É o único caminho que grava no servidor
+  além do script das conversas, e nunca roda sozinho.
+  Conversas que já estão abertas continuam na versão antiga até serem reabertas (fechar a aba e
+  retomar pelo histórico basta); as novas já sobem na nova. Não aparece para o computador local nem
+  para um `claude` que vem da extensão do VS Code/Cursor instalada no servidor (quem atualiza é o
+  editor). Se o npm do servidor for do root (`EACCES`), o erro aparece e a atualização precisa de
+  `sudo` por SSH. Servidor no canal "stable", sem versão nova para ele, responde "já está na mais
+  nova" e o aviso deixa de aparecer. Sem internet no seu computador, o aviso simplesmente não aparece.
+  Exige o programa em segundo plano do Deck atualizado (reinicie com as conversas ociosas); com o
+  antigo, o botão não existe.
 - **Testar todos** (aba Servidores) mede o acesso a cada servidor sem pedir senha e sem gravar
   nada.
 - **Novo servidor SSH** acrescenta o bloco ao `~/.ssh/config`, com uma cópia de segurança em
@@ -315,7 +355,11 @@ Na conversa, clique no ícone de marcador no cabeçalho ou use **Marcar como pen
 - **Copiar e colar**: selecionar texto no terminal copia para a área de transferência do Windows;
   clicar com o botão direito na área do terminal cola o texto da área de transferência no shell.
   Se o texto colado contiver quebras de linha, o shell pode executar os comandos. No Terminal ao
-  Vivo ocupado pelo Claude, a colagem manual continua bloqueada até você parar o turno.
+  Vivo ocupado pelo Claude, a colagem manual continua bloqueada até você parar o turno. Se o
+  navegador negar a leitura da área de transferência (a permissão fica gravada no perfil do app e,
+  bloqueada uma vez, nunca mais é perguntada), o servidor local lê o texto do Windows no lugar dele
+  (`clipboard.readText`, só para quem tem aquele terminal, até 1 MB). `Ctrl+V`, `Ctrl+Shift+V` e
+  `Shift+Insert` colam pelo evento de colar do navegador, que não depende dessa permissão nem do servidor.
 - **Ações**: novo terminal, limpar tela, maximizar, trocar a posição e fechar uma aba.
 
 ### Claude no mesmo terminal que você vê
@@ -405,13 +449,15 @@ npm run test:e2e           # interface completa no Brave (perfil temporário) co
 npm run test:remote        # interface + servidor SSH real (requer DECK_TEST_HOST)
 npm run test:terminal:ui   # MCP + PTY real + terminal à direita, com Claude falso e Brave isolado
 npm run test:cache:ui      # contador do cache de prompt (relógio adiantado na página), com Claude falso e Brave isolado
-npm run test:context:ui    # pizza de uso do contexto (sempre visível, clique compacta direto ou deixa na fila com o Claude ocupado, zera, recarrega), com Claude falso e Brave isolado
+npm run test:context:ui    # pizza e /context abrem modal; botão compacta ou enfileira sem duplicar (Brave isolado + Claude falso)
+npm run test:pins:ui       # fixar mensagem, voltar a ela com 1 clique (inclusive uma antiga), F5 e desafixar (Brave isolado + Claude falso)
 npm run test:autocompact:ui # pizza com a compactação automática definida (500k, 250k, desligada, erro), com Claude falso e Brave isolado
 npm run test:shortcuts     # atalhos com teclado real (abre uma janela de teste por ~1 min)
 npm run test:memory        # 25 conversas remotas + 5 locais abertas ao mesmo tempo
 npm run test:launcher      # atalhos do Windows, código de uso único
 npm run test:copy:ui       # copiar/colar em duas janelas Brave isoladas (conflitos, reload, rascunho)
 npm run test:copy:remote   # idem + local⇄SSH⇄SSH por SFTP (requer DECK_TEST_HOST)
+npm run test:claude-update:ui # botão de atualizar o Claude Code do servidor, com um "claude" falso no servidor de teste (requer DECK_TEST_HOST)
 npm run test:all           # typecheck + unitários + integração + E2E + remoto + launcher
 ```
 

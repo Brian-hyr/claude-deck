@@ -110,18 +110,7 @@ export function isCompactCommand(text: string): boolean {
   return /^\/compact(\s|$)/i.test(text.trim());
 }
 
-const COMPACT_HINTS: Record<CompactAction, string> = {
-  compact: 'Clique para compactar agora (/compact).',
-  enqueue: 'O Claude está trabalhando. Clique para deixar o /compact na fila: ele roda quando o Claude terminar.',
-  queued: '/compact na fila: roda quando o Claude terminar o que está fazendo.',
-  compacting: 'Compactando agora.',
-};
-const COMPACT_ARIA: Record<CompactAction, string> = {
-  compact: 'clique para compactar',
-  enqueue: 'clique para deixar a compactação na fila',
-  queued: 'compactação na fila',
-  compacting: 'compactando',
-};
+const CONTEXT_HINT = 'Clique para ver o detalhamento (/context).';
 const RESERVE_NOTE = 'a reserva para a resposta e para o compactador';
 
 function sourceLabel(source: string | undefined): string | undefined {
@@ -146,7 +135,7 @@ function modelWindowLine(contextWindow: number, withReserve: boolean): string {
 }
 
 /** Dica ao passar o mouse: uso, o que resta, a janela do modelo e a compactação automática definida pelo usuário. */
-export function contextTooltip(m: ContextMeter, action: CompactAction = 'compact'): string {
+export function contextTooltip(m: ContextMeter): string {
   const left = Math.round(m.percentRemaining);
   const auto = m.basis === 'autocompact';
   return [
@@ -154,24 +143,24 @@ export function contextTooltip(m: ContextMeter, action: CompactAction = 'compact
     auto ? `${left}% restante até a compactação automática.` : `${left}% restante da janela útil do modelo.`,
     modelWindowLine(m.contextWindow, !auto),
     autoCompactLine(m.autoCompact),
-    COMPACT_HINTS[action],
+    CONTEXT_HINT,
   ].join('\n');
 }
 
 /** Dica enquanto não há porcentagem (nem a janela do modelo, nem a compactação automática são conhecidas). */
-export function contextUnknownTooltip(s: ContextUsageState, action: CompactAction = 'compact'): string {
+export function contextUnknownTooltip(s: ContextUsageState): string {
   return [
     s.usedTokens > 0 ? `Contexto: ${formatTokens(s.usedTokens)} tokens em uso.` : 'Contexto: ainda sem dados desta conversa.',
     'A janela do modelo e a porcentagem aparecem quando o próximo turno terminar.',
     ...(s.autoCompact ? [autoCompactLine(s.autoCompact)] : []),
-    COMPACT_HINTS[action],
+    CONTEXT_HINT,
   ].join('\n');
 }
 
-export function contextAriaLabel(m: ContextMeter | undefined, action: CompactAction = 'compact'): string {
-  if (!m) return `Uso do contexto ainda desconhecido — ${COMPACT_ARIA[action]}`;
+export function contextAriaLabel(m: ContextMeter | undefined): string {
+  if (!m) return 'Uso do contexto ainda desconhecido — clique para ver o detalhamento';
   const what = m.basis === 'autocompact' ? 'do limite de compactação automática' : 'do contexto';
-  return `${Math.round(m.percentUsed)}% ${what} usado — ${COMPACT_ARIA[action]}`;
+  return `${Math.round(m.percentUsed)}% ${what} usado — clique para ver o detalhamento`;
 }
 
 /** Traço do anel da pizza (círculo de raio 7 numa caixa 20×20): quanto do contorno fica preenchido. */
@@ -225,4 +214,106 @@ export function autoCompactFromResponse(r: any): AutoCompactInfo | undefined {
   const window = source ? n(r.maxTokens) || undefined : undefined;
   if (!threshold) return undefined; // ligada mas sem o limite: não há o que mostrar de confiável
   return { enabled: true, window, threshold, source };
+}
+
+export interface CategoryUsage {
+  name: string;
+  tokens: number;
+  isDeferred?: boolean;
+}
+
+export interface MemoryFileUsage {
+  path: string;
+  tokens: number;
+}
+
+export interface AgentUsage {
+  agentType: string;
+  tokens: number;
+}
+
+export interface DetailedContextUsage {
+  model?: string;
+  totalTokens: number;
+  rawMaxTokens: number;
+  percentage: number;
+  categories: CategoryUsage[];
+  memoryFiles: MemoryFileUsage[];
+  agents: AgentUsage[];
+}
+
+/** Hues validados para os dois temas; mais de oito categorias são agrupadas em "Outras". */
+export const CONTEXT_CATEGORY_COLORS = Array.from({ length: 8 }, (_, i) => `var(--ctx-series-${i + 1})`);
+
+export function colorForCategory(index: number): string {
+  return CONTEXT_CATEGORY_COLORS[index] ?? 'var(--fg-muted)';
+}
+
+export function visibleContextCategories(categories: CategoryUsage[]): CategoryUsage[] {
+  const used = categories.filter((c) => c.tokens > 0 && !c.isDeferred && !/^(free space|espaço livre)$/i.test(c.name));
+  if (used.length <= 8) return used;
+  return [
+    ...used.slice(0, 7),
+    { name: 'Outras categorias', tokens: used.slice(7).reduce((sum, c) => sum + c.tokens, 0) },
+  ];
+}
+
+export function contextPercent(tokens: number, window: number): string {
+  if (!(window > 0) || tokens <= 0) return '0%';
+  const percent = (tokens / window) * 100;
+  return percent < 0.1 ? '<0,1%' : `${percent.toFixed(1).replace('.', ',')}%`;
+}
+
+export function shortenPath(p: string): string {
+  if (!p) return '';
+  return p.replace(/^(\/Users\/[^/]+|\/home\/[^/]+|\/root|[A-Za-z]:[\\/]Users[\\/][^\\/]+)/, '~');
+}
+
+/**
+ * Interpreta a resposta detalhada de `get_context_usage` vinda do Claude Code.
+ */
+export function parseDetailedContextUsage(r: any): DetailedContextUsage | undefined {
+  if (!r || typeof r !== 'object') return undefined;
+  const totalTokens = n(r.totalTokens ?? r.usedTokens);
+  const rawMaxTokens = n(r.rawMaxTokens ?? r.maxTokens);
+  if (!rawMaxTokens) return undefined;
+  const percentage = Math.min(100, Math.max(0, Number.isFinite(r.percentage) ? r.percentage : Math.round((totalTokens / rawMaxTokens) * 100)));
+
+  const categories: CategoryUsage[] = Array.isArray(r.categories)
+    ? r.categories
+        .filter((c: any) => c && typeof c === 'object')
+        .map((c: any) => ({
+          name: String(c.name || 'Outro'),
+          tokens: n(c.tokens),
+          isDeferred: Boolean(c.isDeferred),
+        }))
+    : [];
+
+  const memoryFiles: MemoryFileUsage[] = Array.isArray(r.memoryFiles)
+    ? r.memoryFiles
+        .filter((m: any) => m && typeof m === 'object')
+        .map((m: any) => ({
+          path: String(m.path || ''),
+          tokens: n(m.tokens),
+        }))
+    : [];
+
+  const agents: AgentUsage[] = Array.isArray(r.agents)
+    ? r.agents
+        .filter((a: any) => a && typeof a === 'object')
+        .map((a: any) => ({
+          agentType: String(a.agentType || a.name || 'Agente'),
+          tokens: n(a.tokens),
+        }))
+    : [];
+
+  return {
+    model: typeof r.model === 'string' ? r.model : undefined,
+    totalTokens,
+    rawMaxTokens,
+    percentage,
+    categories,
+    memoryFiles,
+    agents,
+  };
 }

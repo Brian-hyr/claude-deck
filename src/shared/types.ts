@@ -30,8 +30,25 @@ export interface HostStatus {
   home?: string;
   claude?: { path: string; version: string } | null;
   claudeCandidates?: { path: string; version: string }[];
+  /**
+   * Versão mais nova do Claude Code publicada, quando é maior que a do servidor e ele pode ser atualizado
+   * (só SSH). Ausente = em dia, desconhecida ou sem como atualizar. Ver HostRegistry.status.
+   */
+  claudeLatest?: string;
   channels?: number;
   connections?: number;
+}
+
+/** Resultado de `hosts.updateClaude` (atualizar o Claude Code de um servidor). */
+export interface ClaudeUpdateResult {
+  before: string;
+  after: string;
+  /** Versão mais nova publicada, se o Deck conseguiu consultar. */
+  latest?: string;
+  /** A versão subiu. Falso quando o servidor já estava na mais nova do canal dele. */
+  changed: boolean;
+  /** Final da saída do `claude update`, para mostrar ao usuário. */
+  output: string;
 }
 
 export interface FileEntry {
@@ -92,6 +109,26 @@ export interface ManualPendingConversation {
   sessionId: string;
   cwd: string;
 }
+
+/**
+ * Mensagem fixada pelo usuário para voltar a ela depois. É só um marcador de leitura: não entra no transcript
+ * nem no contexto do Claude. `anchor` é o `uuid` da linha do transcript (com `#n` quando a mesma linha tem
+ * mais de um bloco de texto); `snippet` guarda o começo do texto para a lista não depender de carregar a conversa.
+ */
+export interface PinnedMessage {
+  hostId: string;
+  sessionId: string;
+  anchor: string;
+  role: 'user' | 'assistant';
+  snippet: string;
+  /** Quando a mensagem foi enviada (ms), se já se sabia ao fixar. */
+  at?: number;
+  pinnedAt: number;
+}
+
+/** Máximo de mensagens fixadas por conversa e tamanho do trecho guardado (limite do servidor). */
+export const MAX_PINS_PER_CONVERSATION = 100;
+export const PIN_SNIPPET_MAX = 200;
 
 export interface SessionSummary {
   sessionId: string;
@@ -249,6 +286,8 @@ export interface UiState {
   extraRoots?: Record<string, string[]>;
   /** Raízes do explorador minimizadas pelo usuário (chave hostId:root). */
   collapsedRoots?: Record<string, boolean>;
+  /** Colunas de tamanho e data nas linhas do explorador (ausente = escondidas). */
+  explorerDetails?: boolean;
   /** Painel de terminal aberto (à direita ou embaixo, conforme a configuração). */
   terminalVisible?: boolean;
   terminalHeight?: number;

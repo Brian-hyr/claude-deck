@@ -78,6 +78,13 @@ export interface TextItem {
   key: string;
   text: string;
   streaming?: boolean;
+  /**
+   * Âncora estável da mensagem (uuid da linha do transcript; `#n` no n-ésimo bloco de texto da mesma linha).
+   * A `key` não serve: depende da posição na lista e muda entre transcript e fluxo ao vivo. Serve para fixar.
+   */
+  anchor?: string;
+  /** Data/hora da resposta (ms), quando informada. */
+  at?: number;
 }
 export interface ThinkingItem {
   kind: 'thinking';
@@ -153,6 +160,8 @@ export interface ResultItem {
   tokens?: TokenUsage;
   /** Da sessão inteira (soma do `modelUsage`, que é acumulado). */
   sessionTokens?: TokenUsage;
+  /** Data/hora de término/chegada do resultado (ms). */
+  at?: number;
 }
 export interface NoticeItem {
   kind: 'notice';
@@ -358,19 +367,27 @@ export function flattenToolResult(content: any): { text: string; images: ImageDa
   return { text, images };
 }
 
-/** Lê os dados de notificação de um subagente/tarefa concluída (<task-notification>). */
+/** Lê todas as notificações de subagentes/tarefas concluídas (<task-notification>) contidas no texto. */
+export function parseTaskNotifications(raw: string): TaskNotificationData[] {
+  if (typeof raw !== 'string') return [];
+  const matches = [...raw.matchAll(/<task-notification>([\s\S]*?)<\/task-notification>/g)];
+  if (!matches.length) return [];
+  const tag = (inside: string, name: string) => inside.match(new RegExp(`<${name}>([\\s\\S]*?)<\\/${name}>`))?.[1]?.trim();
+  return matches.map((m) => {
+    const inside = m[1];
+    return {
+      taskId: tag(inside, 'task-id'),
+      toolUseId: tag(inside, 'tool-use-id'),
+      status: tag(inside, 'status'),
+      summary: tag(inside, 'summary'),
+      result: tag(inside, 'result'),
+    };
+  });
+}
+
+/** Lê os dados da primeira notificação de um subagente/tarefa concluída (<task-notification>). */
 export function parseTaskNotification(raw: string): TaskNotificationData | null {
-  const m = raw.match(/<task-notification>([\s\S]*?)<\/task-notification>/);
-  if (!m) return null;
-  const inside = m[1];
-  const tag = (name: string) => inside.match(new RegExp(`<${name}>([\\s\\S]*?)<\\/${name}>`))?.[1]?.trim();
-  return {
-    taskId: tag('task-id'),
-    toolUseId: tag('tool-use-id'),
-    status: tag('status'),
-    summary: tag('summary'),
-    result: tag('result'),
-  };
+  return parseTaskNotifications(raw)[0] ?? null;
 }
 
 const AGENT_MESSAGE_RE = /<(agent-message|cross-session-message)\b([^>]*)>([\s\S]*?)<\/\1>/g;
@@ -500,6 +517,8 @@ export class ChatModel {
   /** Modelo anunciado no `init` do CLI e modelo da última mensagem do agente principal: servem para achar a janela no `modelUsage`. */
   private initModel?: string;
   private lastMainModel?: string;
+  /** Horário da última fala do assistente no turno atual (ms), para atribuir data ao resultado caso ele não traga timestamp próprio. */
+  private lastAssistantTime?: number;
   /** Último `/compact` enviado por esta interface e o turno em que o Claude começou a executá-lo (eco do CLI). */
   private compactUuid?: string;
   private compactStartedTurn?: number;
@@ -534,6 +553,7 @@ export class ChatModel {
 
   /** Mensagem enviada pela interface (aparece na hora, confirmada pelo eco do CLI). */
   addPendingUser(uuid: string, text: string, images: ImageData[], at = Date.now()) {
+    this.lastAssistantTime = undefined;
     this.add({ kind: 'user', key: `user:${uuid}`, uuid, text, images, pending: true, at });
     this.seenUuids.add(uuid);
     if (isCompactCommand(text)) {
@@ -654,7 +674,7 @@ export class ChatModel {
         this.onUser(msg, opts);
         return;
       case 'result':
-        this.onResult(msg);
+        this.onResult(msg, opts);
         return;
       case 'system':
         this.onSystem(msg, opts);
@@ -682,6 +702,12 @@ export class ChatModel {
       case 'summary':
       case 'ai-title':
       case 'custom-title':
+        return;
+      case 'queue-operation':
+        this.onQueueOperation(msg);
+        return;
+      case 'attachment':
+        this.onAttachment(msg);
         return;
       default:
         return;
@@ -754,6 +780,8 @@ export class ChatModel {
   }
 
   private onAssistant(msg: any, opts: { history?: boolean }) {
+    const astTime = msgTime(msg);
+    if (astTime !== undefined && !msg.parent_tool_use_id) this.lastAssistantTime = astTime;
     const m = msg.message ?? {};
     const blocks: any[] = Array.isArray(m.content) ? m.content : [];
     const parentId: string | undefined = msg.parent_tool_use_id ?? undefined;
@@ -792,6 +820,8 @@ export class ChatModel {
     }
     const msgId: string = m.id ?? `m${Math.random()}`;
     this.seenAssistant.add(msgId);
+    const lineUuid: string | undefined = typeof msg.uuid === 'string' && msg.uuid ? msg.uuid : undefined;
+    let textBlocks = 0;
     for (const b of blocks) {
       if (b.type === 'tool_use' || b.type === 'server_tool_use' || b.type === 'mcp_tool_use') {
         const existing = this.tools.get(b.id);
@@ -823,15 +853,22 @@ export class ChatModel {
         const kind = b.type === 'text' ? 'text' : 'thinking';
         const target = this.nextStreamed(msgId, kind);
         const text = b.type === 'text' ? (b.text ?? '') : b.type === 'thinking' ? (b.thinking ?? '') : '';
+        // Só texto tem âncora; a contagem anda também para blocos vazios, para o sufixo não variar com eles.
+        const anchor = kind === 'text' && lineUuid ? (textBlocks === 0 ? lineUuid : `${lineUuid}#${textBlocks}`) : undefined;
+        if (kind === 'text') textBlocks++;
         if (target && (target.kind === 'text' || target.kind === 'thinking')) {
           target.text = text || target.text;
           target.streaming = false;
+          if (target.kind === 'text') {
+            if (anchor) target.anchor = anchor;
+            target.at ??= astTime;
+          }
           if (b.type === 'redacted_thinking' && target.kind === 'thinking') target.redacted = true;
           continue;
         }
         if (kind === 'text' && !text.trim()) continue;
         const key = `${msgId}:f${this.items.length}`;
-        if (kind === 'text') this.add({ kind: 'text', key, text });
+        if (kind === 'text') this.add({ kind: 'text', key, text, at: astTime, ...(anchor ? { anchor } : {}) });
         else this.add({ kind: 'thinking', key, text, redacted: b.type === 'redacted_thinking' });
       }
     }
@@ -863,6 +900,7 @@ export class ChatModel {
   }
 
   private onUser(msg: any, opts: { history?: boolean }) {
+    this.lastAssistantTime = undefined;
     const uuid: string | undefined = msg.uuid;
     if (uuid) {
       const pending = this.byKey.get(`user:${uuid}`) as UserItem | undefined;
@@ -974,12 +1012,15 @@ export class ChatModel {
     if (!opts.history && msg.isReplay) this.running = true;
   }
 
-  private onResult(msg: any) {
+  private onResult(msg: any, opts: { history?: boolean; replay?: boolean } = {}) {
     this.turn++;
     this.running = false;
     this.status = null;
     const interrupted = msg.subtype === 'error_during_execution';
     this.endTurnTools(interrupted);
+    const parsedAt = msgTime(msg) ?? (typeof msg.at === 'number' && Number.isFinite(msg.at) ? msg.at : undefined);
+    const at = parsedAt ?? (opts.history || opts.replay ? this.lastAssistantTime : (this.lastAssistantTime ?? Date.now()));
+    this.lastAssistantTime = undefined;
     const r: ResultItem = {
       kind: 'result',
       key: `result:${msg.uuid ?? this.turn}`,
@@ -991,6 +1032,7 @@ export class ChatModel {
       errors: Array.isArray(msg.errors) ? msg.errors : undefined,
       tokens: tokensFromUsage(msg.usage),
       sessionTokens: tokensFromModelUsage(msg.modelUsage),
+      at,
     };
     if (this.byKey.has(r.key)) return;
     // Janela do modelo principal (o resultado traz um item por modelo da sessão). Sem casar, mantém a que já sabia.
@@ -1060,6 +1102,37 @@ export class ChatModel {
         return;
       default:
         return;
+    }
+  }
+
+  private onQueueOperation(msg: any) {
+    const raw = typeof msg.content === 'string' ? msg.content : '';
+    if (!raw || !raw.includes('<task-notification>')) return;
+    for (const tn of parseTaskNotifications(raw)) {
+      this.finishTask(tn.taskId, tn.toolUseId, tn.status === 'failed' || tn.status === 'killed' ? tn.status : 'completed', msgTime(msg));
+    }
+  }
+
+  private onAttachment(msg: any) {
+    const att = msg.attachment;
+    if (!att || typeof att !== 'object') return;
+    if (att.type === 'queued_command') {
+      const prompt = att.prompt;
+      const text = typeof prompt === 'string' ? prompt
+        : Array.isArray(prompt) ? prompt.filter((b: any) => b?.type === 'text' && typeof b.text === 'string').map((b: any) => b.text).join('\n')
+        : '';
+      if (text.includes('<task-notification>')) {
+        const at = msgTime(att) ?? msgTime(msg);
+        for (const tn of parseTaskNotifications(text)) {
+          this.finishTask(tn.taskId, tn.toolUseId, tn.status === 'failed' || tn.status === 'killed' ? tn.status : 'completed', at);
+        }
+      }
+    } else if (att.type === 'task_status' && typeof att.taskId === 'string') {
+      const s = att.status;
+      if (s === 'completed' || s === 'failed' || s === 'killed') {
+        const at = msgTime(att) ?? msgTime(msg);
+        this.finishTask(att.taskId, att.shell?.toolUseId, s, at);
+      }
     }
   }
 
@@ -1208,12 +1281,13 @@ export class ChatModel {
     return false;
   }
 
-  private finishTask(taskId?: string, toolUseId?: string, status: 'completed' | 'failed' | 'killed' = 'completed', at?: number) {
+  finishTask(taskId?: string, toolUseId?: string, status: 'completed' | 'failed' | 'killed' = 'completed', at?: number) {
     const known = taskId ? this.agentTasks.get(taskId) : [...this.agentTasks.values()].find((a) => a.toolUseId === toolUseId);
     const id = taskId ?? known?.taskId ?? toolUseId;
-    const tool = known?.toolUseId ? this.tools.get(known.toolUseId)
+    const tool = (taskId ? [...this.tools.values()].find((t) => isAgentTool(t) && t.result?.structured?.agentId === taskId) : undefined)
+      ?? (known?.toolUseId ? this.tools.get(known.toolUseId)
       : toolUseId ? this.tools.get(toolUseId)
-      : [...this.tools.values()].find((t) => t.result?.structured?.agentId === taskId);
+      : [...this.tools.values()].find((t) => t.result?.structured?.agentId === taskId));
     if (id && (known || tool)) {
       this.recentTasks.set(id, {
         id: known?.toolUseId ?? toolUseId ?? tool?.id ?? id,
@@ -1231,9 +1305,10 @@ export class ChatModel {
       });
       if (this.recentTasks.size > 30) this.recentTasks.delete(this.recentTasks.keys().next().value!);
     }
-    for (const key of [taskId, toolUseId, known?.toolUseId]) if (key) this.endedTasks.add(key);
+    for (const key of [taskId, toolUseId, known?.toolUseId, tool?.id, tool?.result?.structured?.agentId]) if (key) this.endedTasks.add(key);
     if (taskId) this.agentTasks.delete(taskId);
     if (toolUseId) for (const [key, a] of this.agentTasks) if (a.toolUseId === toolUseId) this.agentTasks.delete(key);
+    this.version++;
   }
 
   /** Agentes e outras tarefas para o mapa: os que rodam primeiro, os recém-terminados depois. */
@@ -1260,8 +1335,8 @@ export class ChatModel {
     const out = new Map<string, AgentRun>();
     const MAX_AGENT_AGE_MS = 60 * 60 * 1000;
     const fresh = (t: ToolItem) => {
-      if (t.live) return true;
       if (t.at != null && Date.now() - t.at > MAX_AGENT_AGE_MS) return false;
+      if (t.live) return true;
       return processStartedAt != null && (t.at == null || t.at >= processStartedAt);
     };
     const from = (id: string, background: boolean, tool?: ToolItem, task?: { description: string; type?: string; prompt?: string }): AgentRun => {

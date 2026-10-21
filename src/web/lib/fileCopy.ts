@@ -3,9 +3,11 @@ import { signal } from '@preact/signals';
 import type { FileClipboard, FileCopyJob } from '../../shared/types';
 import { rpc, RpcError } from './rpc';
 import { choiceDialog, confirmDialog, errorText, fileChangedExternally, files, hostLabel, platformOf, toast, windowId } from './state';
-import { relativeTo } from '../../shared/paths';
+import { basename, relativeTo } from '../../shared/paths';
 
 export const fileCopySupported = signal(false);
+/** O servidor aceita copiar um item arrastado de outra janela (origem explícita, sem passar pelo clipboard). */
+export const fileCopyDragSupported = signal(false);
 export const fileClipboard = signal<FileClipboard | null>(null);
 export const fileCopyJobs = signal<FileCopyJob[]>([]);
 export const fileCopyPanel = signal(false);
@@ -36,16 +38,36 @@ export async function pasteExplorerItem(hostId: string, dir: string) {
   if (!supported()) return;
   const c = fileClipboard.peek();
   if (!c) { toast('Copie primeiro um arquivo ou pasta no explorador do Deck.', 'info'); return; }
+  await startCopy({ clipboardId: c.id, revision: c.revision, hostId, dir }, 'Colagem');
+}
+/**
+ * Item arrastado de uma janela de OUTRO servidor e solto numa pasta desta janela. Entre servidores o
+ * item é copiado (como entre discos no Windows): o original continua onde está e nada é apagado.
+ */
+export async function copyDroppedItem(source: { hostId: string; path: string }, hostId: string, dir: string) {
+  if (!fileCopySupported.peek() || !fileCopyDragSupported.peek()) {
+    toast('Arrastar entre servidores exige a versão nova do servidor do Claude Deck (ele se atualiza quando nenhuma conversa está trabalhando). Por enquanto: Ctrl+C no item e Ctrl+V na pasta de destino.', 'info', 10000);
+    return;
+  }
+  const name = basename(source.path);
+  const ok = await confirmDialog(
+    `Copiar ${name} para ${hostLabel(hostId)}?`,
+    `De ${hostLabel(source.hostId)}: ${source.path}\nPara ${hostLabel(hostId)}: ${dir}\n\nEntre servidores diferentes o item é copiado (a versão salva no disco): o original continua onde está.`,
+    'Copiar',
+  );
+  if (ok) await startCopy({ source, hostId, dir }, 'Cópia');
+}
+async function startCopy(params: Record<string, unknown>, label: string) {
   const requestId = crypto.randomUUID();
   try {
-    const job = await rpc.call<FileCopyJob>('fileCopy.start', { requestId, clipboardId: c.id, revision: c.revision, hostId, dir });
+    const job = await rpc.call<FileCopyJob>('fileCopy.start', { requestId, ...params });
     receive(job); fileCopyPanel.value = true;
   } catch (e) {
     // O start pode ter sido recebido antes do timeout: consultar, nunca iniciar outro.
     if (e instanceof RpcError && e.code === 'timeout') {
       try { receive(await rpc.call('fileCopy.get', { requestId })); fileCopyPanel.value = true; return; } catch { /* reconexão consulta lista */ }
     }
-    toast(`Colagem não confirmada: ${errorText(e)}. Consulte as cópias antes de tentar novamente.`, 'error', 8000);
+    toast(`${label} não confirmada: ${errorText(e)}. Consulte as cópias antes de tentar novamente.`, 'error', 8000);
   }
 }
 export async function cancelFileCopy(id: string) {
@@ -79,8 +101,9 @@ async function decide(j: FileCopyJob) {
   } catch (e) { toast(`Decisão da cópia não confirmada: ${errorText(e)}`, 'error'); }
   finally { questions.delete(j.id); }
 }
-export async function syncFileCopies(support: boolean, bootChanged: boolean) {
+export async function syncFileCopies(support: boolean, bootChanged: boolean, dragSupport = false) {
   fileCopySupported.value = support;
+  fileCopyDragSupported.value = support && dragSupport;
   if (bootChanged || !support) {
     generation++; fileClipboard.value = null; fileCopyJobs.value = []; publicationLocks.value = {}; questions.clear();
   }

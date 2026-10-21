@@ -293,7 +293,9 @@ export class HistoryService {
         continue;
       }
       const t = o.type;
-      if (t !== 'user' && t !== 'assistant' && t !== 'system' && t !== 'summary' && t !== 'ai-title' && t !== 'custom-title') continue;
+      const isRelevantQueue = t === 'queue-operation' && typeof o.content === 'string' && (o.content.includes('task-notification') || o.content.includes('<agent-message'));
+      const isRelevantAttachment = t === 'attachment' && (o.attachment?.type === 'task_status' || (o.attachment?.type === 'queued_command' && (typeof o.attachment?.prompt === 'string' || Array.isArray(o.attachment?.prompt))));
+      if (t !== 'user' && t !== 'assistant' && t !== 'system' && t !== 'summary' && t !== 'ai-title' && t !== 'custom-title' && !isRelevantQueue && !isRelevantAttachment) continue;
       if (o.isSidechain && !sidechain) continue;
       lines.push(trimLine(o));
     }
@@ -355,6 +357,12 @@ function trimBlock(b: any): any {
 /** Corta conteúdos enormes (arquivos lidos, saídas longas) para não pesar na interface. */
 export function trimLine(o: any): any {
   const out: any = { ...o };
+  if (out.type === 'queue-operation' && typeof out.content === 'string') {
+    out.content = trimText(out.content);
+  }
+  if (out.type === 'attachment' && out.attachment?.type === 'queued_command') {
+    if (typeof out.attachment.prompt === 'string') out.attachment = { ...out.attachment, prompt: trimText(out.attachment.prompt) };
+  }
   if (out.message && Array.isArray(out.message.content)) out.message = { ...out.message, content: out.message.content.map(trimBlock) };
   else if (out.message && typeof out.message.content === 'string') out.message = { ...out.message, content: trimText(out.message.content) };
   if (out.toolUseResult) {

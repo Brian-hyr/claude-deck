@@ -109,6 +109,25 @@ class CliHost {
     });
   }
 
+  /**
+   * Servidores MCP como o CLI os vê agora (`control_request mcp_status`). A partir da 2.1.301 o CLI não manda
+   * `system init` antes do primeiro turno, então este é o jeito de conferir o registro sem gastar inferência.
+   */
+  async mcpServers(): Promise<any[]> {
+    const r = await this.control({ subtype: 'mcp_status' });
+    return r?.response?.mcpServers ?? [];
+  }
+
+  /** Espera o `deck_terminal` aparecer como conectado no `mcp_status` (o handshake é assíncrono). */
+  async waitDeckTerminal(timeoutMs = 25_000): Promise<any | undefined> {
+    const until = Date.now() + timeoutMs;
+    for (;;) {
+      const found = (await this.mcpServers()).find((s) => s.name === MCP_SERVER_NAME && s.status === 'connected');
+      if (found || Date.now() >= until) return found;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+
   /** Nenhuma mensagem de turno (assistant/stream_event/result) apareceu: nenhuma inferência ocorreu. */
   get sawInference(): boolean {
     return this.lines.some((m) => m.type === 'assistant' || m.type === 'stream_event' || m.type === 'result');
@@ -149,10 +168,10 @@ describe.skipIf(!RUN || !CLAUDE)('Handshake do MCP "deck_terminal" com o CLI de 
     });
     expect(r.subtype).toBe('success');
 
-    const init = await host.wait((m) => m.type === 'system' && m.subtype === 'init', 25_000);
-    log(`system init: mcp_servers=${JSON.stringify(init.mcp_servers)} tools(deck_terminal)=${JSON.stringify((init.tools ?? []).filter((t: string) => t.includes(MCP_SERVER_NAME)))}`);
-    expect(init.mcp_servers).toEqual(expect.arrayContaining([expect.objectContaining({ name: MCP_SERVER_NAME, status: 'connected' })]));
-    for (const name of ['run', 'send', 'read', 'wait']) expect(init.tools).toContain(`mcp__${MCP_SERVER_NAME}__${name}`);
+    const server = await host.waitDeckTerminal();
+    log(`mcp_status: ${JSON.stringify(server)}`);
+    expect(server, '"deck_terminal" deveria estar conectado no mcp_status').toBeDefined();
+    expect(server.tools.map((t: any) => t.name).sort()).toEqual(['read', 'run', 'send', 'wait']);
 
     expect(host.sawInference, 'nenhuma mensagem de turno deveria ter aparecido: nenhum custo de inferência').toBe(false);
   }, 60_000);
@@ -165,10 +184,12 @@ describe.skipIf(!RUN || !CLAUDE)('Handshake do MCP "deck_terminal" com o CLI de 
     // 1) Como um CLI remoto já rodando antes desta funcionalidade existir: initialize SEM sdkMcpServers.
     const r1 = await host.control({ subtype: 'initialize' });
     expect(r1.subtype).toBe('success');
-    const init1 = await host.wait((m) => m.type === 'system' && m.subtype === 'init', 25_000);
-    const hasDeckTerminal1 = (init1.mcp_servers ?? []).some((s: any) => s.name === MCP_SERVER_NAME) || (init1.tools ?? []).some((t: string) => t.includes(MCP_SERVER_NAME));
-    log(`system init #1 (sem sdkMcpServers): mcp_servers=${JSON.stringify(init1.mcp_servers)}`);
-    expect(hasDeckTerminal1, 'sem sdkMcpServers no 1º initialize, o servidor "deck_terminal" não deveria aparecer').toBe(false);
+    const before = await host.mcpServers();
+    log(`mcp_status #1 (sem sdkMcpServers): ${JSON.stringify(before)}`);
+    expect(
+      before.some((s: any) => s.name === MCP_SERVER_NAME),
+      'sem sdkMcpServers no 1º initialize, o servidor "deck_terminal" não deveria aparecer',
+    ).toBe(false);
 
     // 2) initialize DE NOVO, agora com sdkMcpServers — ainda sem nenhuma mensagem de usuário/turno.
     let r2: any;
@@ -178,22 +199,12 @@ describe.skipIf(!RUN || !CLAUDE)('Handshake do MCP "deck_terminal" com o CLI de 
     } catch (e) {
       r2Error = (e as Error).message;
     }
-    log(`initialize #2 (com sdkMcpServers): ${r2Error ? `falhou: ${r2Error}` : JSON.stringify(r2).slice(0, 400)}`);
+    log(`initialize #2 (com sdkMcpServers): ${r2Error ? `falhou: ${r2Error}` : `${r2?.subtype}`}`);
 
-    // Um 2º "system init" (ou mudança de status) comprovaria registro dinâmico; senão, é preciso um
-    // aviso de "não suportado" ou reiniciar/retomar a conversa (ver comentário final do teste).
-    let init2: any;
-    try {
-      init2 = await host.wait((m) => m.type === 'system' && m.subtype === 'init' && m !== init1, 8_000);
-    } catch {
-      init2 = undefined;
-    }
-    const status = await host.control({ subtype: 'mcp_status' }).catch((e) => ({ error: (e as Error).message }));
-    log(`2º "system init"? ${init2 ? JSON.stringify(init2.mcp_servers) : '(nenhum chegou depois do 2º initialize)'}`);
-    log(`mcp_status depois do 2º initialize: ${JSON.stringify(status)}`);
-    const registeredDynamically =
-      (r2?.subtype === 'success' && (init2?.mcp_servers ?? []).some((s: any) => s.name === MCP_SERVER_NAME)) ||
-      (status && !status.error && JSON.stringify(status).includes(MCP_SERVER_NAME));
+    // Registro dinâmico = o servidor aparece no mcp_status depois do 2º initialize, sem turno e sem reiniciar.
+    const server = r2?.subtype === 'success' ? await host.waitDeckTerminal(10_000) : undefined;
+    log(`mcp_status depois do 2º initialize: ${JSON.stringify(server ?? '(deck_terminal ausente)')}`);
+    const registeredDynamically = !!server;
     log(
       registeredDynamically
         ? 'CONCLUSÃO: o CLI registrou "deck_terminal" dinamicamente num 2º initialize — uma sessão remota já em execução pode ganhar o terminal ao vivo sem reiniciar.'

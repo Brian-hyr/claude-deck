@@ -11,6 +11,7 @@ import {
   confirmDialog,
   errorText,
   expandedDirs,
+  explorerDetails,
   explorerRefresh,
   extraRoots,
   folderBrowser,
@@ -32,15 +33,15 @@ import {
   sidebarVisible,
 } from '../lib/state';
 import type { FileEntry } from '../../shared/types';
-import { basename, dirname, join, moveBlocked, normalize, relativeTo, tildify } from '../../shared/paths';
+import { basename, dirname, join, moveBlocked, normalize, relativeTo, sepOf, tildify } from '../../shared/paths';
 import { FileIcon, Icon } from './icons';
 import { openMenu } from './ContextMenu';
-import { formatBytes, formatDateTime, fuzzyScore } from '../lib/format';
+import { formatBytes, formatDateCompact, formatDateTime, fuzzyScore } from '../lib/format';
 import { planFromDrop, planFromFileList, type UploadPlan } from '../lib/dropTree';
 import { downloadEntry, downloadUrlData, prefetchTicket } from '../lib/download';
 import { flattenTree, isDirEntry as isDir, makeJoin, ROW_H, type TreeRow } from '../lib/treeRows';
 import { useRowWindow } from '../lib/useRowWindow';
-import { copyExplorerItem, pasteExplorerItem } from '../lib/fileCopy';
+import { copyDroppedItem, copyExplorerItem, pasteExplorerItem } from '../lib/fileCopy';
 
 interface DirState {
   items?: FileEntry[];
@@ -50,6 +51,12 @@ interface DirState {
 
 const dirCache = signal<Record<string, DirState>>({});
 const selected = signal<string | null>(null);
+/** O item da seleção: os botões "Novo arquivo/Nova pasta" do cabeçalho criam ali (como no VS Code). */
+let selectedEntry: { hostId: string; path: string; folder: boolean } | null = null;
+function select(hostId: string, path: string, folder: boolean) {
+  selected.value = key(hostId, path);
+  selectedEntry = { hostId, path, folder };
+}
 const editing = signal<{ parent: string; kind: 'file' | 'folder' | 'rename'; path?: string } | null>(null);
 const showHidden = signal(true);
 /** Arrasto do Windows sobre o espaço livre do explorador (destaca o painel inteiro). */
@@ -134,6 +141,39 @@ function setExpanded(hostId: string, p: string, open: boolean) {
   if (open) list.add(p);
   else list.delete(p);
   expandedDirs.value = { ...expandedDirs.value, [hostId]: [...list].slice(-300) };
+}
+
+/** Abre todos os níveis de `root` até `dir` (inclusive): o campo de nome só aparece dentro de pasta aberta. */
+function expandTo(hostId: string, root: string, dir: string) {
+  const plat = platformOf(hostId);
+  const rel = relativeTo(plat, root, dir);
+  if (!rel) return;
+  const list = new Set(expandedDirs.value[hostId] ?? []);
+  let cur = root;
+  for (const seg of rel.split(sepOf(plat))) {
+    cur = join(plat, cur, seg);
+    list.add(cur);
+    loadDir(hostId, cur);
+  }
+  expandedDirs.value = { ...expandedDirs.value, [hostId]: [...list].slice(-300) };
+}
+
+/**
+ * Onde os botões do cabeçalho de `root` criam: na pasta selecionada, na pasta do arquivo selecionado ou,
+ * sem seleção nesta raiz (ou se o item selecionado sumiu), na própria raiz.
+ */
+function newItemDir(hostId: string, root: string): string {
+  const s = selectedEntry;
+  if (!s || s.hostId !== hostId || selected.peek() !== key(hostId, s.path)) return root;
+  const plat = platformOf(hostId);
+  const dir = s.folder ? s.path : dirname(plat, s.path);
+  const rel = relativeTo(plat, root, dir);
+  if (rel === null) return root;
+  if (rel === '') return dir;
+  // Apagada, renomeada ou movida: a listagem da pasta de cima (atualizada nessas ações) não tem mais essa pasta.
+  const parent = dirCache.peek()[key(hostId, dirname(plat, dir))]?.items;
+  if (parent && !parent.some((e) => isDir(e) && e.name === basename(dir))) return root;
+  return dir;
 }
 
 /** Envia um arquivo com progresso (XHR: o fetch não informa o andamento do envio). */
@@ -506,6 +546,14 @@ export function Explorer() {
             <Icon name="close" />
           </button>
         )}
+        <button
+          class={`icon-btn${explorerDetails.value ? ' on' : ''}`}
+          title={explorerDetails.value ? 'Ocultar tamanho e data' : 'Mostrar tamanho e data'}
+          aria-pressed={explorerDetails.value}
+          onClick={() => (explorerDetails.value = !explorerDetails.value)}
+        >
+          <Icon name="table" />
+        </button>
       </div>
       <div class="tree-scroller" style={{ flex: 1, overflow: 'auto', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
         <ExplorerRoot hostId={ws.hostId} root={ws.root} isWorkspace />
@@ -514,6 +562,8 @@ export function Explorer() {
         ))}
         {/* Espaço vazio abaixo da árvore: também é "soltar aqui" (para a pasta principal). */}
         <div class="explorer-fill" style={{ flex: 1, minHeight: 48 }} tabIndex={0}
+          // Clique no vazio desfaz a seleção: os botões "Novo arquivo/Nova pasta" voltam a criar na raiz.
+          onClick={() => { selected.value = null; selectedEntry = null; }}
           onContextMenu={(e) => openMenu(e as any, [{ label: 'Colar aqui', icon: 'clippy', kb: 'Ctrl+V', action: () => pasteExplorerItem(ws.hostId, ws.root) }])} />
       </div>
     </div>
@@ -568,10 +618,12 @@ function ExplorerRoot({ hostId, root, isWorkspace, onUnpin }: { hostId: string; 
 
   const newItem = (kind: 'file' | 'folder', parent = root) => {
     if (collapsed) toggleCollapse();
-    if (parent !== root) setExpanded(hostId, parent, true);
+    if (parent !== root) expandTo(hostId, root, parent);
     loadDir(hostId, parent);
     editing.value = { parent, kind };
   };
+  /** Botões do cabeçalho: dentro do que está selecionado nesta raiz (o menu do cabeçalho continua criando na raiz). */
+  const newItemHere = (kind: 'file' | 'folder') => newItem(kind, newItemDir(hostId, root));
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: 'none' }}>
@@ -610,10 +662,10 @@ function ExplorerRoot({ hostId, root, isWorkspace, onUnpin }: { hostId: string; 
           {isWorkspace && hostId !== 'local' && <span style={{ fontWeight: 400, opacity: 0.7 }}> [{hostId}]</span>}
           {!isWorkspace && <span style={{ fontWeight: 400, opacity: 0.7 }}> — {tildify(root, homeOf(hostId))}</span>}
         </span>
-        <button class="icon-btn keep" title="Novo arquivo" onClick={(e) => (e.stopPropagation(), newItem('file'))}>
+        <button class="icon-btn keep" title="Novo arquivo" onClick={(e) => (e.stopPropagation(), newItemHere('file'))}>
           <Icon name="new-file" />
         </button>
-        <button class="icon-btn keep" title="Nova pasta" onClick={(e) => (e.stopPropagation(), newItem('folder'))}>
+        <button class="icon-btn keep" title="Nova pasta" onClick={(e) => (e.stopPropagation(), newItemHere('folder'))}>
           <Icon name="new-folder" />
         </button>
         {isWorkspace && (
@@ -819,7 +871,7 @@ export async function revealInExplorer(hostId: string, target: string): Promise<
     expandedDirs.value = { ...expandedDirs.peek(), [hostId]: [...open].slice(-300) };
   }
   const k = key(hostId, cur);
-  selected.value = k;
+  select(hostId, cur, true);
 
   // A árvore desenha depois deste tick (e depois de a barra lateral montar, se estava em outra visão).
   for (let i = 0; i < 40; i++) {
@@ -848,6 +900,7 @@ function VirtualTree(props: { hostId: string; root: string; items: FileEntry[]; 
   const plat = platformOf(hostId);
   const ed = editing.value;
   const hidden = showHidden.value;
+  const details = explorerDetails.value;
   const dirs = dirCache.value;
   const expandedList = expandedDirs.value[hostId];
   const expanded = useMemo(() => new Set(expandedList ?? []), [expandedList]);
@@ -901,7 +954,7 @@ function VirtualTree(props: { hostId: string; root: string; items: FileEntry[]; 
               {r.message}
             </div>
           );
-        return <TreeRowView key={r.key} hostId={hostId} row={r} top={top} onNew={props.onNew} />;
+        return <TreeRowView key={r.key} hostId={hostId} row={r} top={top} details={details} onNew={props.onNew} />;
       })}
     </div>
   );
@@ -977,8 +1030,8 @@ function NameInput({ hostId, depth, initial, top }: { hostId: string; depth: num
 }
 
 /** Uma linha montada da árvore (arquivo ou pasta). Aberta/fechada, filtro e renomear já vêm resolvidos em `row`. */
-function TreeRowView(props: { hostId: string; row: Extract<TreeRow, { t: 'entry' }>; top: number; onNew: (k: 'file' | 'folder', parent: string) => void }) {
-  const { hostId, row, top } = props;
+function TreeRowView(props: { hostId: string; row: Extract<TreeRow, { t: 'entry' }>; top: number; details: boolean; onNew: (k: 'file' | 'folder', parent: string) => void }) {
+  const { hostId, row, top, details } = props;
   const { dir, full, entry, depth, folder, open, loading } = row;
   const k = key(hostId, full);
   const [dropping, setDropping] = useState(false);
@@ -995,14 +1048,14 @@ function TreeRowView(props: { hostId: string; row: Extract<TreeRow, { t: 'entry'
   };
 
   const onClick = (e: MouseEvent) => {
-    selected.value = k;
+    select(hostId, full, folder);
     if (folder) toggle();
     else openFile(hostId, full, { activate: true });
     e.stopPropagation();
   };
 
   const menu = (e: MouseEvent) => {
-    selected.value = k;
+    select(hostId, full, folder);
     const chat = activeChat.value;
     const items = [
       ...(folder
@@ -1020,6 +1073,10 @@ function TreeRowView(props: { hostId: string; row: Extract<TreeRow, { t: 'entry'
             { label: 'Abrir', icon: 'go-to-file', action: () => openFile(hostId, full) },
             { label: 'Abrir como texto', icon: 'file-code', action: () => openFile(hostId, full, { mode: 'edit' }) },
             { label: 'Baixar', icon: 'cloud-download', action: () => downloadEntry(hostId, full, false) },
+            { separator: true },
+            // Na pasta onde este arquivo está (sem precisar achar a linha da pasta).
+            { label: 'Novo arquivo nesta pasta…', icon: 'new-file', action: () => props.onNew('file', dir) },
+            { label: 'Nova pasta nesta pasta…', icon: 'new-folder', action: () => props.onNew('folder', dir) },
             { separator: true },
           ]),
       ...(chat && chat.state.value.hostId === hostId
@@ -1143,6 +1200,9 @@ function TreeRowView(props: { hostId: string; row: Extract<TreeRow, { t: 'entry'
         <FileIcon name={entry.name} dir={folder} open={open} />
         <span class="label">{entry.name}</span>
         {entry.type === 'symlink' && <Icon name="link" style={{ fontSize: 12, opacity: 0.6 }} />}
+        {/* Pasta sem tamanho: o do sistema de arquivos é o do próprio diretório (ex.: 4 KB), não o do conteúdo. */}
+        {details && <span class="meta size">{folder || !Number.isFinite(entry.size) ? '' : formatBytes(entry.size)}</span>}
+        {details && <span class="meta date">{entry.mtime ? formatDateCompact(entry.mtime) : ''}</span>}
       </div>
   );
 }
@@ -1179,7 +1239,8 @@ function dropMove(e: DragEvent, hostId: string, destDir: string): boolean {
   }
   if (!item.path) return true;
   if (item.hostId !== hostId) {
-    toast('Mover entre servidores diferentes ainda não é possível.', 'info', 4000);
+    // Veio da janela de outro servidor: copia (o original fica onde está), com confirmação.
+    if (typeof item.hostId === 'string') void copyDroppedItem({ hostId: item.hostId, path: item.path }, hostId, destDir);
     return true;
   }
   void moveEntry(hostId, item.path, !!item.dir, destDir);

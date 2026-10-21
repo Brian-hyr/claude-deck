@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatDateTime, formatFullDateTime, formatInt, formatTokens } from '../../src/web/lib/format';
+import { formatDateCompact, formatDateTime, formatFullDateTime, formatInt, formatTokens } from '../../src/web/lib/format';
 
 // Os formatadores foram criados uma vez (era um por chamada). O texto tem que ser exatamente o de antes.
 
@@ -39,6 +39,14 @@ describe('formatadores em cache dão o mesmo texto de antes', () => {
       const ms = new Date(s).getTime();
       expect(formatDateTime(ms)).toBe(ANTES.dateTime(ms));
     }
+  });
+  it('formatDateCompact (coluna de data do explorador)', () => {
+    const now = new Date('2026-10-15T12:00:00').getTime();
+    // Mesmo ano: dia/mês e hora. Outro ano: dia/mês/ano de 2 dígitos, sem hora.
+    expect(formatDateCompact(new Date('2026-10-01T13:45:02').getTime(), now)).toBe('01/10 13:45');
+    expect(formatDateCompact(new Date('2026-01-05T00:07:00').getTime(), now)).toBe('05/01 00:07');
+    expect(formatDateCompact(new Date('2025-12-31T23:59:59').getTime(), now)).toBe('31/12/25');
+    expect(formatDateCompact(new Date('2024-02-29T09:05:07').getTime(), now)).toBe('29/02/24');
   });
   it('rápido: milhares de chamadas', () => {
     const t0 = performance.now();

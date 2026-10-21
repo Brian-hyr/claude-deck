@@ -2,7 +2,7 @@
 // "Claude falso" para testes: fala o protocolo stream-json do Claude Code (initialize, mensagens
 // parciais, ferramentas, pedidos de permissão, interrupção) e grava um transcript como o real.
 // Comandos (texto da mensagem): echo <x> | write <arquivo> | edit <arquivo> | bash | ask | deep | plan |
-// todo | slow | image | agentmsg [texto] | bgagent [n] | agentdone | compactsim | ctx <tokens> | crash | long | markdown | term <comando> | termkeys <tecla,...> | termread | termtools
+// todo | slow | slowfx | image | agentmsg [texto] | bgagent [n] | agentdone | compactsim | ctx <tokens> | crash | long | markdown | term <comando> | termkeys <tecla,...> | termread | termtools
 // ("deep" = raciocínio + leitura de arquivo e só então a pergunta, como uma cadeia de trabalho real)
 // ("term" = usa a ferramenta do terminal ao vivo do app — servidor MCP "sdk" pelo canal de controle,
 //  como o CLI de verdade: handshake initialize/tools/list e tools/call via "mcp_message")
@@ -20,7 +20,7 @@ const argVal = (name) => {
 const resume = argVal('--resume');
 let mode = argVal('--permission-mode') || 'default';
 let model = argVal('--model') || 'fake-sonnet';
-const effort = argVal('--effort') || 'default';
+let effort = argVal('--effort') || 'default';
 const sessionId = resume || crypto.randomUUID();
 const cwd = process.cwd();
 const claudeDir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
@@ -129,7 +129,7 @@ function toolResult(toolUseId, content, isError = false, structured) {
 let totalCostUsd = 0;
 function result(subtype = 'success', start = Date.now()) {
   totalCostUsd += 0.0012;
-  out({ type: 'result', subtype, is_error: subtype !== 'success', duration_ms: Date.now() - start, duration_api_ms: 10, num_turns: 1, session_id: sessionId, total_cost_usd: totalCostUsd, usage: { input_tokens: 271, cache_creation_input_tokens: 0, cache_read_input_tokens: 25088, output_tokens: 6 }, modelUsage: { [model]: { inputTokens: 25613, outputTokens: 27, cacheReadInputTokens: 25088, cacheCreationInputTokens: 0, costUSD: totalCostUsd, ...(ctxWindow ? { contextWindow: ctxWindow, maxOutputTokens: 4000 } : {}) } }, permission_denials: [], uuid: crypto.randomUUID() });
+  out({ type: 'result', subtype, is_error: subtype !== 'success', duration_ms: Date.now() - start, duration_api_ms: 10, num_turns: 1, session_id: sessionId, total_cost_usd: totalCostUsd, usage: { input_tokens: 271, cache_creation_input_tokens: 0, cache_read_input_tokens: 25088, output_tokens: 6 }, modelUsage: { [model]: { inputTokens: 25613, outputTokens: 27, cacheReadInputTokens: 25088, cacheCreationInputTokens: 0, costUSD: totalCostUsd, ...(ctxWindow ? { contextWindow: ctxWindow, maxOutputTokens: 4000 } : {}) } }, permission_denials: [], uuid: crypto.randomUUID(), timestamp: new Date().toISOString() });
 }
 
 async function runTool(msgId, name, input, run) {
@@ -208,7 +208,7 @@ async function handleUser(msg) {
         });
         if (!interrupted && !r?.interrupt) assistant(msgId + 'b', [{ type: 'text', text: r?.denied ? 'Terminal negado.' : 'Terminal usado.' }]);
       }
-    } else if (cmd === 'echo' || cmd === 'markdown' || cmd === 'long' || !['write', 'edit', 'bash', 'bashfail', 'ask', 'askmulti', 'deep', 'plan', 'todo', 'slow', 'image', 'agentmsg', 'agentperm', 'bgagent', 'agentdone', 'compactsim'].includes(cmd)) {
+    } else if (cmd === 'echo' || cmd === 'markdown' || cmd === 'long' || !['write', 'edit', 'bash', 'bashfail', 'ask', 'askmulti', 'deep', 'plan', 'todo', 'slow', 'image', 'slowfx', 'agentmsg', 'agentperm', 'bgagent', 'agentdone', 'compactsim'].includes(cmd)) {
       let reply = cmd === 'effort' ? `esforço=${effort} sessão=${sessionId}` : cmd === 'echo' ? arg : cmd === 'markdown' ? '# Título\n\nTexto com **negrito**, `src/app.ts:12` e lista:\n\n- um\n- dois\n\n```ts\nconst x: number = 1;\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |' : cmd === 'long' ? Array.from({ length: 200 }, (_, i) => `Linha ${i + 1} do texto longo.`).join('\n\n') : `Recebi: ${text}${images ? ` (+${images} imagem)` : ''} [modo=${mode}]`;
       await streamText(msgId, 0, reply, cmd === 'long' ? 1 : 15);
       assistant(msgId, [{ type: 'text', text: reply }]);
@@ -281,6 +281,13 @@ async function handleUser(msg) {
       }
       out({ type: 'stream_event', event: { type: 'content_block_stop', index: 0 }, session_id: sessionId, parent_tool_use_id: null, uuid: crypto.randomUUID() });
       assistant(msgId, [{ type: 'text', text: acc }]);
+    } else if (cmd === 'slowfx') {
+      // "slowfx 30" = espera 3 s e, como uma próxima ação do modelo, lê o esforço vigente naquele instante.
+      const n = Math.min(Math.max(parseInt(arg, 10) || 30, 1), 600);
+      for (let i = 0; i < n && !interrupted; i++) await sleep(100);
+      const reply = `esforço-na-próxima-ação=${effort}`;
+      await streamText(msgId, 0, reply, 15);
+      assistant(msgId, [{ type: 'text', text: reply }]);
     } else if (cmd === 'agentmsg') {
       // Outro agente escreve para esta conversa: chega como mensagem de "usuário" com <agent-message> em texto puro.
       const body = arg || 'Read-only checkout search: Worker source NOT present.\nMP webhook HMAC em `src/index.ts:12`.';
@@ -410,8 +417,17 @@ rl.on('line', (line) => {
         isReplay: true,
       });
       out({ type: 'control_response', response: { subtype: 'success', request_id: m.request_id, response: {} } });
+    } else if (r.subtype === 'apply_flag_settings') {
+      // Como o CLI: vale a partir da próxima chamada ao modelo, inclusive no meio do turno.
+      // FAKE_NO_FLAG_SETTINGS=1 simula um CLI antigo, que não conhece o pedido.
+      if (process.env.FAKE_NO_FLAG_SETTINGS) {
+        out({ type: 'control_response', response: { subtype: 'error', request_id: m.request_id, error: 'Unsupported control request subtype: apply_flag_settings' } });
+      } else {
+        if ('effortLevel' in (r.settings ?? {})) effort = r.settings.effortLevel ?? 'default';
+        out({ type: 'control_response', response: { subtype: 'success', request_id: m.request_id, response: {} } });
+      }
     } else if (r.subtype === 'get_settings') {
-      out({ type: 'control_response', response: { subtype: 'success', request_id: m.request_id, response: { lastPermissions } } });
+      out({ type: 'control_response', response: { subtype: 'success', request_id: m.request_id, response: { lastPermissions, applied: { model, effort: effort === 'default' ? null : effort } } } });
     } else if (r.subtype === 'get_context_usage') {
       // Registra cada pedido (o teste confere que a interface pergunta uma vez por processo, não a cada turno).
       if (process.env.FAKE_CONTEXT_CALLS_FILE) fs.appendFileSync(process.env.FAKE_CONTEXT_CALLS_FILE, `${r.detail ?? '-'}\n`);
@@ -422,7 +438,22 @@ rl.on('line', (line) => {
       if (ac === 'error') {
         out({ type: 'control_response', response: { subtype: 'error', request_id: m.request_id, error: 'fake: get_context_usage falhou' } });
       } else {
-        const base = { totalTokens: 12345, maxTokens: 200000, percentage: 6 };
+        const base = {
+          totalTokens: 12345,
+          maxTokens: 200000,
+          rawMaxTokens: 200000,
+          percentage: 6,
+          model: model || 'fake-sonnet',
+          categories: [
+            { name: 'System prompt', tokens: 3200 },
+            { name: 'System tools', tokens: 2100 },
+            { name: 'MCP tools', tokens: 1500 },
+            { name: 'Messages', tokens: 5545 },
+            { name: 'Free space', tokens: 187655 },
+          ],
+          memoryFiles: [{ path: '/home/usuario/app/memory/regras.md', tokens: 380 }],
+          agents: [{ agentType: 'Explore', tokens: 1200 }],
+        };
         let extra = {};
         if (ac === 'off') extra = { isAutoCompactEnabled: false };
         else if (Number(ac) > 0) {
@@ -430,7 +461,10 @@ rl.on('line', (line) => {
           // Como o CLI: limite = janela − min(saída máxima, 20k) − 13k (a saída máxima do fake é 4.000).
           extra = { maxTokens: window, rawMaxTokens: window, autocompactSource: process.env.FAKE_AUTOCOMPACT_SOURCE || 'env', autoCompactThreshold: window - Math.min(4000, 20000) - 13000, isAutoCompactEnabled: true };
         }
-        out({ type: 'control_response', response: { subtype: 'success', request_id: m.request_id, response: { ...base, ...extra } } });
+        const max = extra.rawMaxTokens ?? base.rawMaxTokens;
+        const categories = base.categories.map((category) => category.name === 'Free space'
+          ? { ...category, tokens: Math.max(0, max - base.totalTokens) } : category);
+        out({ type: 'control_response', response: { subtype: 'success', request_id: m.request_id, response: { ...base, ...extra, categories } } });
       }
     } else out({ type: 'control_response', response: { subtype: 'error', request_id: m.request_id, error: `fake: ${r.subtype} não suportado` } });
     return;

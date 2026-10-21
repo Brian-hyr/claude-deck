@@ -76,9 +76,12 @@ md.use({
         `<pre><code class="hljs${l ? ` language-${l}` : ''}">${highlightCode(text, lang)}</code></pre></div>`
       );
     },
+    codespan({ text }: Tokens.Codespan) {
+      return `<code title="Duplo clique para copiar">${text}</code>`;
+    },
     link({ href, title, tokens }: Tokens.Link) {
       const text = this.parser.parseInline(tokens);
-      const t = title ? ` title="${escapeHtml(title)}"` : '';
+      const t = title ? ` title="${escapeHtml(title)}"` : ' title="Clique para abrir · Duplo clique para copiar"';
       return `<a href="${escapeHtml(href)}"${t} data-href="${escapeHtml(href)}">${text}</a>`;
     },
     // Listas de tarefas: <input> é removido pelo DOMPurify, então a caixinha vira um <span>.
@@ -129,6 +132,35 @@ export function renderMarkdown(text: string, imgResolver?: (src: string) => stri
   return html;
 }
 
+/** Copia texto para a área de transferência com fallback. */
+export async function copyToClipboard(text: string): Promise<boolean> {
+  if (!text) return false;
+  try {
+    if (navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    /* tenta fallback */
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    ta.style.pointerEvents = 'none';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 /** Liga os botões "copiar" dos blocos de código dentro de um elemento. */
 export function wireCodeCopy(root: HTMLElement) {
   root.querySelectorAll<HTMLButtonElement>('.md-copy').forEach((b) => {
@@ -136,9 +168,11 @@ export function wireCodeCopy(root: HTMLElement) {
     b.dataset.wired = '1';
     b.addEventListener('click', () => {
       const code = b.closest('.md-code')?.querySelector('code')?.textContent ?? '';
-      navigator.clipboard.writeText(code).then(() => {
-        b.innerHTML = '<i class="codicon codicon-check"></i>';
-        setTimeout(() => (b.innerHTML = '<i class="codicon codicon-copy"></i>'), 1200);
+      copyToClipboard(code).then((ok) => {
+        if (ok) {
+          b.innerHTML = '<i class="codicon codicon-check"></i>';
+          setTimeout(() => (b.innerHTML = '<i class="codicon codicon-copy"></i>'), 1200);
+        }
       });
     });
   });

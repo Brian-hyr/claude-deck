@@ -48,9 +48,11 @@ import { TerminalPanel } from './TerminalPanel';
 import { StatusBar } from './StatusBar';
 import { FileCopyPanel } from './FileCopyPanel';
 import { AttentionMenu } from './AttentionMenu';
+import { PinsMenu } from './PinsMenu';
 import { ContextMenuHost } from './ContextMenu';
 import { AuthPromptDialog, GenericDialogs, Toasts } from './Dialogs';
 import { CommandPalette, NewChatPicker, QuickOpen } from './Pickers';
+import { ContextModal } from './ContextModal';
 
 const VIEWS: { id: SidebarView; icon: string; title: string }[] = [
   { id: 'explorer', icon: 'files', title: 'Explorador (Ctrl+Shift+E)' },
@@ -69,7 +71,8 @@ const TITLES: Record<SidebarView, string> = {
 
 function ActivityBar() {
   const waiting = chats.value.filter((c) => c.attention.value === 'permission').length;
-  const pending = pendingCountFor(windowContext.value?.hostId ?? workspace.value?.hostId ?? 'local');
+  const context = windowContext.value;
+  const pending = pendingCountFor(context?.hostId ?? workspace.value?.hostId ?? 'local', context ? context.cwd : workspace.value?.root);
   const pick = (v: SidebarView) => {
     if (sidebarView.value === v && sidebarVisible.value) sidebarVisible.value = false;
     else {
@@ -306,6 +309,7 @@ export function App() {
       </div>
       <StatusBar />
       <AttentionMenu />
+      <PinsMenu />
       <ContextMenuHost />
       <NewChatPicker />
       <QuickOpen />
@@ -313,6 +317,7 @@ export function App() {
       <FolderBrowser />
       <AddHostDialog />
       <FileCopyPanel />
+      <ContextModal />
       <GenericDialogs />
       <AuthPromptDialog />
       <Lightbox />

@@ -11,11 +11,16 @@ import {
   hostLabel,
   hosts,
   isPending,
+  isPinned,
+  messageJump,
+  pinsFor,
   setConversationPending,
+  setMessagePinned,
   loadChat,
   loadEarlier,
   newChat,
   newChatPicker,
+  openContextModal,
   renamingSid,
   sidebarView,
   sidebarVisible,
@@ -28,6 +33,7 @@ import { Markdown } from './Markdown';
 import { ToolCard } from './ToolCard';
 import { Composer } from './Composer';
 import { openMenu } from './ContextMenu';
+import { togglePinsMenu } from './PinsMenu';
 import { formatCost, formatDuration, formatElapsed, formatFullDateTime, formatInt, formatTokens } from '../lib/format';
 import { openChatPath } from '../lib/chatPaths';
 import { tildify } from '../../shared/paths';
@@ -94,6 +100,55 @@ function CopyMsgButton({ text }: { text: string }) {
     </button>
   );
 }
+
+/** Começo do texto em uma linha só, para a lista de fixadas (sem marcas de título/negrito/código nem blocos colados). */
+function snippetOf(text: string, hasImages = false): string {
+  const flat = text
+    .replace(PASTED, ' [texto colado] ')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/[`*]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 200);
+  return flat || (hasImages ? '[imagem]' : '');
+}
+
+/**
+ * Alfinete da mensagem: fixa/desafixa para voltar a ela depois pela lista do cabeçalho. É só um marcador de
+ * leitura — não escreve na caixa de mensagem nem manda nada ao Claude.
+ */
+function PinMsgButton({ c, anchor, role, text, at, hasImages }: { c: ChatTab; anchor: string; role: 'user' | 'assistant'; text: string; at?: number; hasImages?: boolean }) {
+  const st = c.state.value;
+  const pinned = isPinned(st.hostId, st.sessionId, anchor);
+  const label = pinned ? 'Desafixar mensagem' : 'Fixar mensagem para voltar a ela depois';
+  return (
+    <button
+      class={`msg-pin${pinned ? ' pinned' : ''}`}
+      type="button"
+      title={label}
+      aria-label={label}
+      aria-pressed={pinned}
+      disabled={!st.sessionId}
+      onClick={(e) => {
+        e.stopPropagation();
+        void setMessagePinned(st.hostId, st.sessionId, { anchor, role, snippet: snippetOf(text, hasImages), at }, !pinned);
+      }}
+    >
+      <Icon name={pinned ? 'pinned' : 'pin'} style={{ fontSize: 12 }} />
+    </button>
+  );
+}
+
+/** Destaque rápido da mensagem a que se acabou de pular. Direto no DOM: não re-renderiza o Markdown memoizado. */
+function flashMessage(el: HTMLElement) {
+  el.classList.remove('msg-flash');
+  void el.offsetWidth; // reinicia a animação se a mensagem já estava piscando
+  el.classList.add('msg-flash');
+  window.setTimeout(() => el.classList.remove('msg-flash'), 2200);
+}
+
+/** Páginas anteriores que o pulo carrega, no máximo, procurando uma mensagem antiga. */
+const MAX_JUMP_PAGES = 40;
 
 function InjectedSkillItem({ item, onOpenPath }: { item: UserItem; onOpenPath: (p: string) => void }) {
   const [open, setOpen] = useState(false);
@@ -257,11 +312,26 @@ function tokensTitle(r: ResultItem): string {
   return text;
 }
 
-function WorkGroup({ items, c, renderChild }: { items: Item[]; c: ChatTab; renderChild: (it: Item) => any }) {
+export function WorkGroup({ items, c, renderChild }: { items: Item[]; c: ChatTab; renderChild: (it: Item) => any }) {
   // Sempre recolhido até você abrir. Pergunta/permissão/plano pendentes nunca chegam aqui:
   // `groupChatItems` os solta fora do grupo, então recolher a cadeia não esconde nada que espera você.
   const [userOpen, setUserOpen] = useState(false);
+  const [showAll, setShowAll] = useState(false);
   const open = userOpen;
+
+  const toggle = () => {
+    if (open) {
+      setUserOpen(false);
+      setShowAll(false);
+    } else {
+      setUserOpen(true);
+    }
+  };
+
+  const minimize = () => {
+    setUserOpen(false);
+    setShowAll(false);
+  };
 
   const tools = items.filter((it) => it.kind === 'tool') as ToolItem[];
   const thoughts = items.filter((it) => it.kind === 'thinking');
@@ -272,6 +342,14 @@ function WorkGroup({ items, c, renderChild }: { items: Item[]; c: ChatTab; rende
     (isAgentTool(t) && runningAgents.some((a) => a.id === t.id || a.taskId === t.id || (t.result?.structured?.agentId && a.agentId === t.result.structured.agentId)));
   const running = items.some((it) => (it.kind === 'tool' && isToolRunning(it as ToolItem)) || (it.kind === 'thinking' && it.streaming));
   const hasError = items.some((it) => it.kind === 'tool' && it.status === 'error');
+
+  const hasMany = items.length > 10;
+  const visibleItems = hasMany && !showAll ? items.slice(-10) : items;
+  const hiddenCount = items.length - visibleItems.length;
+  const hiddenErrors = useMemo(() => {
+    if (hiddenCount <= 0) return 0;
+    return items.slice(0, hiddenCount).filter((it) => it.kind === 'tool' && it.status === 'error').length;
+  }, [items, hiddenCount]);
 
   let totalExecutions = 0;
   const toolCounts: Record<string, number> = {};
@@ -311,7 +389,18 @@ function WorkGroup({ items, c, renderChild }: { items: Item[]; c: ChatTab; rende
 
   return (
     <div class={`work-group${open ? ' open' : ''}${hasError ? ' has-error' : ''}`}>
-      <div class="work-group-head" onClick={() => setUserOpen(!open)}>
+      <div
+        class="work-group-head"
+        onClick={toggle}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            toggle();
+          }
+        }}
+      >
         <span class="work-group-icon">
           {running ? (
             <Icon name="sync" class="spin" style={{ color: 'var(--accent)' }} />
@@ -323,9 +412,88 @@ function WorkGroup({ items, c, renderChild }: { items: Item[]; c: ChatTab; rende
         </span>
         <span class="work-group-title">{running ? `${title} (em andamento)` : title}</span>
         {toolSummary && <span class="work-group-summary">{toolSummary}</span>}
-        <Icon name={open ? 'chevron-down' : 'chevron-right'} style={{ color: 'var(--fg-faint)', fontSize: 12, marginLeft: 'auto' }} />
+        <span class="work-group-action-hint">
+          {open ? 'Recolher' : hasMany ? 'Ver últimas 10' : 'Expandir'}
+        </span>
+        <Icon name={open ? 'chevron-down' : 'chevron-right'} style={{ color: 'var(--fg-faint)', fontSize: 12, flexShrink: 0 }} />
       </div>
-      {open && <div class="work-group-body">{items.map(renderChild)}</div>}
+      {open && (
+        <>
+          <div class="work-group-body">
+            {hasMany && (
+              <div class="work-group-more">
+                <button
+                  type="button"
+                  class="work-group-more-btn"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setShowAll(!showAll);
+                  }}
+                  title={showAll ? 'Exibir apenas as 10 operações mais recentes' : `Exibir todas as ${items.length} operações deste bloco`}
+                >
+                  <Icon name={showAll ? 'chevron-up' : 'history'} style={{ fontSize: 12 }} />
+                  <span>
+                    {showAll
+                      ? 'Mostrar apenas as últimas 10 operações'
+                      : `Mostrar ${hiddenCount} ${hiddenCount === 1 ? 'operação anterior' : 'operações anteriores'}${hiddenErrors > 0 ? ` (${hiddenErrors} com erro)` : ''} · total: ${items.length}`}
+                  </span>
+                </button>
+                {!showAll && (
+                  <span class="work-group-live-tag" title="Exibindo em tempo real as 10 operações mais recentes">
+                    {running ? (
+                      <>
+                        <Icon name="sync" class="spin" style={{ fontSize: 10, color: 'var(--accent)' }} />
+                        <span>ao vivo · últimas 10</span>
+                      </>
+                    ) : (
+                      <span>últimas 10</span>
+                    )}
+                  </span>
+                )}
+                {showAll && (
+                  <span class="work-group-live-tag" title="Exibindo todas as operações">
+                    todas ({items.length})
+                  </span>
+                )}
+              </div>
+            )}
+            {visibleItems.map(renderChild)}
+          </div>
+          <div
+            class="work-group-foot"
+            onClick={minimize}
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                minimize();
+              }
+            }}
+            title="Recolher operações (minimizar)"
+          >
+            {showAll && hasMany && (
+              <button
+                type="button"
+                class="work-group-foot-action"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setShowAll(false);
+                }}
+                title="Voltar a exibir apenas as últimas 10 operações"
+              >
+                <Icon name="history" style={{ fontSize: 11 }} />
+                <span>Mostrar apenas 10</span>
+              </button>
+            )}
+            <div class="work-group-foot-main">
+              <Icon name="chevron-up" style={{ fontSize: 12 }} />
+              <span>Recolher operações</span>
+              {hasMany && !showAll && <span class="work-group-foot-hint">(últimas 10)</span>}
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -401,6 +569,45 @@ export function Chat({ c }: { c: ChatTab }) {
     stick.current = false;
   }, [pendingKeys, c.sid]);
 
+  // Pulo até uma mensagem fixada (pedido pela lista do cabeçalho). Só leitura: rola e destaca, nada mais.
+  // Se ela está num trecho antigo ainda não carregado, vai buscando as páginas anteriores.
+  const jump = messageJump.value;
+  useEffect(() => {
+    if (!jump || jump.sid !== c.sid) return;
+    let cancelled = false;
+    const find = () => scroller.current?.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(jump.anchor)}"]`) ?? null;
+    void (async () => {
+      try {
+        let el = find();
+        if (!el && c.hasMore.value) {
+          toast('Procurando a mensagem no histórico…');
+          stick.current = false; // carregar páginas refaz a lista: o "acompanhar o fim" não pode puxar a tela
+          for (let page = 0; !el && !cancelled && c.hasMore.value && page < MAX_JUMP_PAGES; page++) {
+            await loadEarlier(c);
+            await new Promise((r) => setTimeout(r, 60)); // deixa a tela redesenhar com a página nova
+            el = find();
+          }
+        }
+        if (cancelled) return;
+        if (!el) {
+          toast('Não encontrei essa mensagem na conversa. Ela pode ter sido compactada ou estar dentro de um bloco recolhido.', 'error', 7000);
+          return;
+        }
+        stick.current = false;
+        el.scrollIntoView({ block: 'center' });
+        flashMessage(el);
+      } catch (e) {
+        if (!cancelled) toast(`Não consegui ir até a mensagem: ${errorText(e)}`, 'error');
+      } finally {
+        // Consumido: voltar a esta aba depois não pode repetir o pulo.
+        if (messageJump.peek()?.n === jump.n) messageJump.value = null;
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [jump?.n, c.sid]);
+
   const onScroll = () => {
     const el = scroller.current!;
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
@@ -450,8 +657,10 @@ export function Chat({ c }: { c: ChatTab }) {
           return <InjectedAutoItem key={u.key} item={u} onOpenPath={openPath} />;
         }
         const isLatest = it.key === lastUserKey;
+        // Só mensagem já confirmada (com uuid do transcript) pode ser fixada.
+        const canPin = !!it.uuid && !it.pending && !it.failed;
         return (
-          <div key={it.key} class={`msg user${isLatest ? ' sticky-latest' : ''}`}>
+          <div key={it.key} class={`msg user${isLatest ? ' sticky-latest' : ''}`} data-anchor={canPin ? it.uuid : undefined}>
             <div class={`user-bubble${it.pending ? ' pending' : ''}${it.failed ? ' failed' : ''}`}>
               {it.images.length > 0 && (
                 <div class="imgs">
@@ -463,20 +672,28 @@ export function Chat({ c }: { c: ChatTab }) {
               <UserText text={it.text} />
               {it.failed && <div class="msg-fail">Não enviada: {it.failed}</div>}
             </div>
+            {/* A hora continua logo depois da bolha (irmã direta); o alfinete vem depois dela e o CSS o põe à esquerda da hora. */}
             {it.at !== undefined && (
               <time class="msg-time" dateTime={new Date(it.at).toISOString()} title={fullSentAt(it.at)}>
                 {formatSentAt(it.at)}
               </time>
             )}
+            {canPin && <PinMsgButton c={c} anchor={it.uuid!} role="user" text={it.text} at={it.at} hasImages={it.images.length > 0} />}
           </div>
         );
       }
       case 'text': {
         const role = roles.get(it.key);
         const isResponse = role !== 'step';
+        const canPin = isResponse && !!it.anchor && !it.streaming && it.text.trim().length > 0;
         return (
-          <div key={it.key} class={`msg${role === 'step' ? ' msg-step' : role === 'final' ? ' msg-final' : ''}${isResponse ? ' msg-response' : ''}${it.streaming ? ' stream-caret-wrap' : ''}`}>
+          <div
+            key={it.key}
+            class={`msg${role === 'step' ? ' msg-step' : role === 'final' ? ' msg-final' : ''}${isResponse ? ' msg-response' : ''}${it.streaming ? ' stream-caret-wrap' : ''}`}
+            data-anchor={canPin ? it.anchor : undefined}
+          >
             {isResponse && it.text.trim().length > 0 && <CopyMsgButton text={it.text} />}
+            {canPin && <PinMsgButton c={c} anchor={it.anchor!} role="assistant" text={it.text} at={it.at} />}
             {role === 'final' && <div class="final-label">Resposta</div>}
             <Markdown text={it.text} onOpenPath={openPath} class={it.streaming ? 'streaming' : ''} />
           </div>
@@ -490,6 +707,11 @@ export function Chat({ c }: { c: ChatTab }) {
         return (
           <div key={it.key} class={`result-line${it.isError && it.subtype !== 'error_during_execution' ? ' error' : ''}`}>
             {it.isError && it.subtype !== 'error_during_execution' && <span>{it.errors?.join(' · ') || `Terminou com erro (${it.subtype})`}</span>}
+            {it.at !== undefined && Number.isFinite(it.at) && (
+              <time class="result-time" dateTime={new Date(it.at).toISOString()} title={fullSentAt(it.at)}>
+                {formatSentAt(it.at)}
+              </time>
+            )}
             {it.durationMs != null && <span title="Duração do turno">{formatDuration(it.durationMs)}</span>}
             {it.tokens && (
               <span class="result-tokens" title={tokensTitle(it)}>
@@ -622,7 +844,7 @@ export function Chat({ c }: { c: ChatTab }) {
             <div class="working">
               <ClaudeLogo size={14} />
               <span>
-                {c.model.status === 'compacting' ? 'Compactando a conversa' : activeTodo?.activeForm ?? 'Trabalhando'}
+                {c.model.status === 'compacting' ? 'Compactando a conversa' : activeTodo?.activeForm ?? (running ? 'Trabalhando' : `${runningAgents.length} ${runningAgents.length === 1 ? 'agente em execução' : 'agentes em execução'}`)}
                 <span class="dots" />
               </span>
               {turnSince !== null && (
@@ -724,6 +946,7 @@ function ChatHeader({ c }: { c: ChatTab }) {
   const runningAgents = c.model.runningAgents(procStart);
   const isWorking = (c.model.running || st.phase === 'running' || runningAgents.length > 0) && st.phase !== 'dormant' && st.phase !== 'ended';
   const phase = isWorking ? 'running' : st.phase;
+  const pinCount = pinsFor(st.hostId, st.sessionId).length;
 
   const agentStartTime = useMemo(() => {
     if (!runningAgents.length) return null;
@@ -765,6 +988,16 @@ function ChatHeader({ c }: { c: ChatTab }) {
       >
         <Icon name="bookmark" />
       </button>
+      <button
+        class={`icon-btn pins-toggle${pinCount ? ' has-pins' : ''}`}
+        title={st.sessionId ? (pinCount ? `Mensagens fixadas (${pinCount}) — clique para ver e voltar a elas` : 'Mensagens fixadas — fixe uma mensagem pelo alfinete que aparece ao passar o mouse sobre ela') : 'Envie a primeira mensagem para poder fixar mensagens'}
+        aria-label="Mensagens fixadas"
+        disabled={!st.sessionId}
+        onClick={(e) => togglePinsMenu(c.sid, e.currentTarget as HTMLElement)}
+      >
+        <Icon name={pinCount ? 'pinned' : 'pin'} />
+        {pinCount > 0 && <span class="pins-count">{pinCount}</span>}
+      </button>
       <button class="icon-btn" title="Histórico de conversas desta pasta" onClick={() => ((sidebarView.value = 'history'), (sidebarVisible.value = true))}>
         <Icon name="history" />
       </button>
@@ -788,15 +1021,7 @@ function ChatHeader({ c }: { c: ChatTab }) {
             {
               label: 'Uso do contexto',
               icon: 'dashboard',
-              action: async () => {
-                try {
-                  const r = await rpc.call('sessions.control', { sid: c.sid, request: { subtype: 'get_context_usage', detail: 'summary' } });
-                  const pct = r?.percentage ?? (r?.totalTokens && r?.maxTokens ? Math.round((r.totalTokens / r.maxTokens) * 100) : null);
-                  toast(`Contexto: ${r?.totalTokens?.toLocaleString('pt-BR') ?? '?'} de ${r?.maxTokens?.toLocaleString('pt-BR') ?? '?'} tokens${pct != null ? ` (${pct}%)` : ''}`, 'info', 8000);
-                } catch (e) {
-                  toast(errorText(e), 'error');
-                }
-              },
+              action: () => openContextModal(c.sid),
             },
             { label: 'Copiar id da sessão', icon: 'copy', disabled: !st.sessionId, action: () => navigator.clipboard.writeText(st.sessionId ?? '') },
             {

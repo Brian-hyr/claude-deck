@@ -6,7 +6,7 @@ import { render } from 'preact';
 import { signal } from '@preact/signals';
 import { ChatModel, type ToolItem } from '../../src/web/lib/chatModel';
 import { rpc } from '../../src/web/lib/rpc';
-import { activateChat, activeChatId, chats, pendingConversations, pendingSupported, setConversationPending, type ChatTab } from '../../src/web/lib/state';
+import { activateChat, activeChatId, appPlatform, chats, hostStatus, pendingConversations, pendingCountFor, pendingSupported, setConversationPending, type ChatTab } from '../../src/web/lib/state';
 import { AttentionMenu, attentionLists, attentionMenu } from '../../src/web/components/AttentionMenu';
 import { StatusBar } from '../../src/web/components/StatusBar';
 import type { SessionState } from '../../src/shared/types';
@@ -80,7 +80,34 @@ afterEach(() => {
   attentionMenu.value = null;
   pendingConversations.value = {};
   pendingSupported.value = false;
+  hostStatus.value = {};
   vi.restoreAllMocks();
+});
+
+describe('contador de pendências por pasta', () => {
+  it('separa pastas no mesmo servidor, incluindo conversa com aba fechada e caminhos Windows equivalentes', () => {
+    appPlatform.value = 'win32';
+    pendingConversations.value = {
+      a: { hostId: 'local', sessionId: 'a', cwd: 'C:\\Projetos\\App\\' },
+      b: { hostId: 'local', sessionId: 'b', cwd: 'C:\\Projetos\\API' },
+      ssh: { hostId: 'srv', sessionId: 'c', cwd: '/opt/app' },
+    };
+    expect(pendingCountFor('local', 'c:/projetos/app')).toBe(1);
+    expect(pendingCountFor('local', 'C:\\Projetos\\API')).toBe(1);
+    expect(pendingCountFor('local')).toBe(2);
+    expect(pendingCountFor('srv', '/opt/app')).toBe(1);
+  });
+
+  it('compara as pastas SSH com distinção de maiúsculas e sem misturar outro servidor', () => {
+    pendingConversations.value = {
+      a: { hostId: 'srv', sessionId: 'a', cwd: '/home/dev/app/' },
+      b: { hostId: 'srv', sessionId: 'b', cwd: '/home/dev/App' },
+      c: { hostId: 'outro', sessionId: 'c', cwd: '/home/dev/app' },
+    };
+    expect(pendingCountFor('srv', '/home/dev/app')).toBe(1);
+    expect(pendingCountFor('srv', '/home/dev/App')).toBe(1);
+    expect(pendingCountFor('srv')).toBe(2);
+  });
 });
 
 describe('attentionLists', () => {

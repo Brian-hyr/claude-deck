@@ -87,11 +87,11 @@ await scenario('modelo de 1M, compactação automática definida em 500k pela va
     // Fake: limite = 500.000 − 4.000 (saída máxima) − 13.000 = 483.000.
     h.assert(
       p.title.split('\n').slice(1).join('\n') ===
-        '100% restante até a compactação automática.\nJanela do modelo: 1M tokens.\nCompactação automática: definida em 500k (variável de ambiente). Compacta em 483k, já descontada a reserva para a resposta e para o compactador.\nClique para compactar agora (/compact).',
+        '100% restante até a compactação automática.\nJanela do modelo: 1M tokens.\nCompactação automática: definida em 500k (variável de ambiente). Compacta em 483k, já descontada a reserva para a resposta e para o compactador.\nClique para ver o detalhamento (/context).',
       `dica inesperada:\n${p.title}`,
     );
     h.assert(p.title.split('\n')[0] === 'Contexto: 0 de 483k tokens usados (0%).', `primeira linha inesperada: ${p.title.split('\n')[0]}`);
-    h.assert(p.aria === '0% do limite de compactação automática usado — clique para compactar', `rótulo inesperado: ${p.aria}`);
+    h.assert(p.aria === '0% do limite de compactação automática usado — clique para ver o detalhamento', `rótulo inesperado: ${p.aria}`);
   });
 
   await step('a porcentagem é sobre o limite da compactação (300k de 483k = 62%), não sobre a janela de 1M (que daria 31%)', async () => {
@@ -99,7 +99,7 @@ await scenario('modelo de 1M, compactação automática definida em 500k pela va
     await h.waitFor(() => document.querySelector('.composer .ctx-pie')?.getAttribute('data-context-percent') === '62', 8000, 'pizza em 62%');
     const p = await pie();
     h.assert(p.title.split('\n')[0] === 'Contexto: 300k de 483k tokens usados (62%).', `dica inesperada: ${p.title.split('\n')[0]}`);
-    h.assert(p.aria === '62% do limite de compactação automática usado — clique para compactar', `rótulo inesperado: ${p.aria}`);
+    h.assert(p.aria === '62% do limite de compactação automática usado — clique para ver o detalhamento', `rótulo inesperado: ${p.aria}`);
     await shot('500k-62-por-cento');
   });
 

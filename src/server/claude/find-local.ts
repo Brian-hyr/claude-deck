@@ -2,21 +2,14 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { compareVersions } from '../../shared/version';
+
+export { compareVersions };
 
 export interface ClaudeBinary {
   path: string;
   version: string;
   source: string;
-}
-
-export function compareVersions(a: string, b: string): number {
-  const pa = a.split(/[.-]/).map((x) => parseInt(x, 10) || 0);
-  const pb = b.split(/[.-]/).map((x) => parseInt(x, 10) || 0);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
-    if (d) return d;
-  }
-  return 0;
 }
 
 function readJsonVersion(file: string): string {

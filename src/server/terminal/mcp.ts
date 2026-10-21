@@ -89,6 +89,21 @@ const TOOLS = [
 ];
 
 /**
+ * Versões do protocolo MCP que este servidor realmente fala. Os métodos que ele usa (initialize, tools/list,
+ * tools/call, ping) têm o mesmo formato em todas elas. Mais nova primeiro.
+ */
+export const MCP_PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'] as const;
+
+/**
+ * Resposta ao `initialize`: se o cliente propõe uma versão suportada, vale essa; senão responde com a mais nova
+ * que sabemos e o cliente decide se aceita. Ecoar uma versão desconhecida (ex.: uma revisão futura que exige
+ * campos como `resultType`/`ttlMs` nas respostas) diria ao CLI que falamos algo que este servidor não implementa.
+ */
+export function negotiateProtocolVersion(requested: unknown): string {
+  return typeof requested === 'string' && (MCP_PROTOCOL_VERSIONS as readonly string[]).includes(requested) ? requested : MCP_PROTOCOL_VERSIONS[0];
+}
+
+/**
  * Servidor MCP mínimo (JSON-RPC 2.0): initialize, tools/list, tools/call e ping. As chamadas
  * rodam em paralelo; cada uma pode ser cancelada pelo Claude (notifications/cancelled).
  */
@@ -109,7 +124,7 @@ export class TerminalMcpServer {
     switch (msg.method) {
       case 'initialize':
         return reply({
-          protocolVersion: typeof msg.params?.protocolVersion === 'string' ? msg.params.protocolVersion : '2025-06-18',
+          protocolVersion: negotiateProtocolVersion(msg.params?.protocolVersion),
           capabilities: { tools: { listChanged: false } },
           serverInfo: { name: 'claude-deck-terminal', version: '1.0.0' },
           instructions: TERMINAL_INSTRUCTIONS,

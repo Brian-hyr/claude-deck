@@ -3,7 +3,7 @@
 // com servidores alheios. O histórico de outro servidor fica na janela dele (aba Servidores).
 import { useEffect, useState } from 'preact/hooks';
 import { rpc } from '../lib/rpc';
-import { chats, errorText, homeOf, hostLabel, isPending, openHistoryChat, pendingConversations, pendingCountFor, pendingSupported, setConversationPending, toast, windowContext, workspace } from '../lib/state';
+import { chats, errorText, homeOf, hostLabel, isPending, openHistoryChat, pendingConversations, pendingCountFor, pendingSupported, sameFolder, setConversationPending, toast, windowContext, workspace } from '../lib/state';
 import type { SessionSummary } from '../../shared/types';
 import { Icon } from './icons';
 import { openMenu } from './ContextMenu';
@@ -26,6 +26,7 @@ export function History() {
   const hostId = ctx?.hostId ?? ws?.hostId ?? 'local';
   const folder = ctx ? ctx.cwd : ws?.root;
   const [mode, setMode] = useState<'folder' | 'all' | 'pending'>(folder ? 'folder' : 'all');
+  const [pendingScope, setPendingScope] = useState<'folder' | 'all'>('folder');
   const [cwd, setCwd] = useState<string | undefined>(folder);
   const [list, setList] = useState<SessionSummary[] | null>(null);
   const [projects, setProjects] = useState<ProjectRow[] | null>(null);
@@ -37,6 +38,7 @@ export function History() {
   useEffect(() => {
     setCwd(folder);
     setProjectDir(null);
+    setPendingScope('folder');
     setMode(folder ? 'folder' : 'all');
   }, [hostId, folder]);
 
@@ -68,7 +70,11 @@ export function History() {
 
   const openIds = new Set(chats.value.map((c) => c.state.value.sessionId));
   const needle = q.trim().toLowerCase();
-  const visible = (list ?? []).filter((s) => (mode === 'pending' || showArchived || !s.archived) && (!needle || `${s.title} ${s.firstPrompt ?? ''}`.toLowerCase().includes(needle)));
+  const visible = (list ?? []).filter((s) =>
+    (mode !== 'pending' || pendingScope === 'all' || !folder || (s.cwd && sameFolder(hostId, s.cwd, folder))) &&
+    (mode === 'pending' || showArchived || !s.archived) &&
+    (!needle || `${s.title} ${s.firstPrompt ?? ''}`.toLowerCase().includes(needle)),
+  );
   const archivedCount = (list ?? []).filter((s) => s.archived).length;
 
   const open = (s: SessionSummary) => {
@@ -116,11 +122,19 @@ export function History() {
           <button class={mode === 'all' ? 'on' : ''} onClick={() => (setMode('all'), setProjectDir(null))}>
             Todas as pastas
           </button>
-          {pendingSupported.value && <button class={mode === 'pending' ? 'on' : ''} onClick={() => (setMode('pending'), setProjectDir(null))}>
-            Pendentes{pendingCountFor(hostId) ? ` (${pendingCountFor(hostId)})` : ''}
+          {pendingSupported.value && <button class={mode === 'pending' ? 'on' : ''} onClick={() => (setMode('pending'), setPendingScope('folder'), setProjectDir(null))}>
+            Pendentes{pendingCountFor(hostId, folder) ? ` (${pendingCountFor(hostId, folder)})` : ''}
           </button>}
         </div>
       </div>
+      {mode === 'pending' && folder && (
+        <div class="seg" style={{ margin: '2px 8px 4px 12px', alignSelf: 'flex-start' }}>
+          <button class={pendingScope === 'folder' ? 'on' : ''} onClick={() => setPendingScope('folder')}>Esta pasta</button>
+          <button class={pendingScope === 'all' ? 'on' : ''} onClick={() => setPendingScope('all')}>
+            Todas as pastas{pendingCountFor(hostId) > pendingCountFor(hostId, folder) ? ` (${pendingCountFor(hostId)})` : ''}
+          </button>
+        </div>
+      )}
       {mode === 'folder' && cwd && (
         <div class="tree-empty" style={{ padding: '2px 12px 4px 14px' }} title={cwd}>
           <Icon name="folder" style={{ fontSize: 13 }} /> {tildify(cwd, homeOf(hostId))}
@@ -189,7 +203,7 @@ export function History() {
             </div>
           ))}
         {(mode === 'folder' || projectDir || mode === 'pending') && list && !visible.length && !err && (
-          <div class="tree-empty">{needle ? 'Nada encontrado.' : mode === 'pending' ? 'Nenhuma conversa pendente neste servidor.' : 'Nenhuma conversa nesta pasta ainda.'}</div>
+          <div class="tree-empty">{needle ? 'Nada encontrado.' : mode === 'pending' ? pendingScope === 'folder' && folder ? 'Nenhuma conversa pendente nesta pasta.' : 'Nenhuma conversa pendente neste servidor.' : 'Nenhuma conversa nesta pasta ainda.'}</div>
         )}
         {mode !== 'pending' && archivedCount > 0 && (
           <div class="tree-empty">

@@ -49,8 +49,8 @@ Abaixo está o comparativo técnico detalhado das vantagens do Claude Deck em re
 - Suporta **cópia instantânea ao selecionar com o mouse** e **colagem imediata com o clique direito**, acelerando o fluxo de trabalho diário.
 
 ### 📊 6. Paridade Completa de Contexto e Compactação
-- O Claude Deck reproduz fielmente a "pizza" de uso de contexto e a compactação com 1 clique da extensão oficial, mostrando a porcentagem consumida e o threshold de auto-compactação.
-- Oferece a mesma conveniência e tranquilidade visual da extensão, mas em uma interface enxuta que não disputa recursos com seu trabalho.
+- Como a extensão oficial, o Deck mostra um indicador de contexto e oferece `/context` detalhado: distribuição de tokens por categoria, arquivos de memória e agentes, quando informados pelo Claude Code.
+- A pizza abre a análise; o botão **Compactar agora** dentro do modal aciona `/compact` separadamente. Assim é possível olhar o consumo antes de decidir compactar.
 
 ### 🔄 7. Compatibilidade Total e Sem Lock-in
 - O Claude Deck não inventa formatos proprietários: ele lê e grava nos arquivos JSONL padrão do Claude Code em `~/.claude/projects`.

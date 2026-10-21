@@ -38,6 +38,8 @@ interface Conn {
   limit: number;
   sftp?: Promise<SFTPWrapper>;
   alive: boolean;
+  /** Encerrada de propósito por nós (close()): não é queda de rede. */
+  closing?: boolean;
 }
 
 export interface RunResult {
@@ -79,6 +81,33 @@ export class SshHost extends EventEmitter {
 
   get connectionCount(): number {
     return this.conns.filter((c) => c.alive).length;
+  }
+
+  /**
+   * Usos longos do SFTP (downloads, uploads, leituras grandes): o canal SFTP é um só e não mostra quantos há.
+   * Cada marca vale só enquanto a conexão em que foi feita existe: uma operação que estava no ar quando a
+   * conexão fechou nunca recebe resposta (o callback não volta), então nunca chegaria a soltar a marca e a
+   * conexão seguinte ficaria "ocupada" para sempre.
+   */
+  private leases = new Set<object>();
+
+  /** Marca um uso longo da conexão. Devolve a função que o encerra (pode ser chamada mais de uma vez). */
+  hold(): () => void {
+    const token = {};
+    this.leases.add(token);
+    return () => {
+      this.leases.delete(token);
+    };
+  }
+
+  /**
+   * Algo além do SFTP parado depende desta conexão? Conta canais abertos (conversas, terminais, comandos
+   * em andamento), a conexão/SFTP sendo aberta agora e os usos longos marcados com `hold()`.
+   */
+  get busy(): boolean {
+    if (this.connecting || this.sftpOpening || this.leases.size > 0) return true;
+    // O canal SFTP fica aberto de graça enquanto a conexão existe: não conta como uso.
+    return this.conns.some((c) => c.alive && c.channels - (c.sftp ? 1 : 0) > 0);
   }
 
   /** Garante uma conexão pronta (reaproveita a existente). */
@@ -238,10 +267,13 @@ export class SshHost extends EventEmitter {
         const wasAlive = conn.alive;
         conn.alive = false;
         this.conns = this.conns.filter((c) => c !== conn);
+        // As operações SFTP que estavam no ar morreram com a conexão: suas marcas de uso não voltam mais.
+        if (wasAlive) this.leases.clear();
         if (!settled) fail(new DeckError('ssh', 'Conexão encerrada durante o login.'));
         if (wasAlive) {
-          log(`[${alias}] conexão #${conn.id} caiu`);
-          this.emit('conn-closed', conn.id);
+          log(`[${alias}] conexão #${conn.id} ${conn.closing ? 'encerrada' : 'caiu'}`);
+          // Encerrada de propósito (desconectar, soltar por falta de uso) não é queda: ninguém deve reanexar sozinho.
+          if (!conn.closing) this.emit('conn-closed', conn.id);
           if (!this.connected) this.emit('state', 'idle');
         }
       });
@@ -633,7 +665,13 @@ export class SshHost extends EventEmitter {
 
   /** Derruba as conexões (usado nos testes de queda de rede e ao desconectar). */
   close() {
-    for (const c of this.conns) {
+    // Tira da lista já: o socket só fecha alguns instantes depois, e nesse intervalo quem pedisse uma conexão
+    // receberia esta, já encerrando ("Not connected"). Pedidos novos abrem uma conexão nova.
+    const closing = this.conns;
+    this.conns = [];
+    this.leases.clear();
+    for (const c of closing) {
+      c.closing = true;
       try {
         c.client.end();
       } catch {

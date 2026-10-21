@@ -7,6 +7,7 @@ import {
   activeTerminalId,
   chats,
   closeTerminal,
+  ensureTerminal,
   onTerminalData,
   onTerminalSync,
   openTerminal,
@@ -18,7 +19,7 @@ import {
   terminalWidth,
   updateSettings,
 } from '../lib/state';
-import { rpc } from '../lib/rpc';
+import { rpc, RpcError } from '../lib/rpc';
 import { TermHighlighter } from '../lib/termHighlight';
 import { isTerminalReport } from '../../shared/terminalProtocol';
 import { Icon } from './icons';
@@ -94,9 +95,7 @@ export function TerminalPanel({ dock }: { dock: 'right' | 'bottom' }) {
 
   // Garante que há ao menos um terminal se o painel estiver visível
   useEffect(() => {
-    if (tabs.length === 0) {
-      openTerminal().catch(() => {});
-    }
+    if (tabs.length === 0) void ensureTerminal();
   }, [tabs.length]);
 
   // Se o tema mudar, atualiza as instâncias abertas
@@ -182,12 +181,25 @@ export function TerminalPanel({ dock }: { dock: 'right' | 'bottom' }) {
   };
 
   const pasteClipboard = async (id: string) => {
+    let text: string;
     try {
-      const text = await navigator.clipboard.readText();
-      if (text && terminalTabs.value.some((t) => t.id === id)) instances.get(id)?.term.paste(text);
+      text = await navigator.clipboard.readText();
     } catch {
-      toast('Não foi possível ler a área de transferência para colar no terminal.', 'error');
+      // A janela do app (--app, perfil próprio) grava a permissão da área de transferência: bloqueada uma vez,
+      // o navegador nega sempre e nunca mais pergunta. O servidor roda nesta máquina e lê a mesma área.
+      try {
+        text = await rpc.call<string>('clipboard.readText', { id }, 10_000);
+      } catch (e) {
+        toast(
+          e instanceof RpcError && e.code === 'nomethod'
+            ? 'O navegador bloqueou a leitura da área de transferência. Cole com Ctrl+V, ou reinicie o servidor do Deck para o botão direito voltar a colar.'
+            : `Não foi possível ler a área de transferência para colar no terminal.${e instanceof RpcError && e.code !== 'timeout' ? ` ${e.message}` : ''}`,
+          'error',
+        );
+        return;
+      }
     }
+    if (text && terminalTabs.value.some((t) => t.id === id)) instances.get(id)?.term.paste(text);
   };
 
   const mountInstance = (id: string, el: HTMLDivElement | null) => {
@@ -221,6 +233,15 @@ export function TerminalPanel({ dock }: { dock: 'right' | 'bottom' }) {
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(el);
+    // Ctrl+V / Ctrl+Shift+V / Shift+Insert: sem isto o xterm manda ^V (0x16) ao shell e cancela o evento de colar
+    // do navegador. Devolvendo false, o navegador dispara "paste" na caixa de texto do xterm, que cola o texto do
+    // evento (não precisa da permissão da área de transferência, que no perfil do app pode estar bloqueada).
+    term.attachCustomKeyEventHandler((e) => {
+      if (e.type !== 'keydown' || e.altKey || e.metaKey) return true;
+      const ctrlV = e.ctrlKey && e.code === 'KeyV';
+      const shiftInsert = e.shiftKey && !e.ctrlKey && e.code === 'Insert';
+      return !(ctrlV || shiftInsert);
+    });
     term.onSelectionChange(() => {
       const text = term.getSelection();
       if (text) navigator.clipboard.writeText(text).catch(() => toast('Não foi possível copiar a seleção do terminal.', 'error'));

@@ -96,6 +96,38 @@ describe('modelo da conversa (captura real do CLI)', () => {
     expect(r.sessionTokens).toEqual({ input: 26309, cacheRead: 25088, cacheCreate: 0, output: 41 });
   });
 
+  it('resultado registra data e hora de chegada (at) a partir do timestamp ou hora local', () => {
+    // 1. Com timestamp explícito no evento result
+    const m1 = new ChatModel();
+    const iso = '2026-10-15T14:32:00.000Z';
+    m1.apply({ type: 'result', subtype: 'success', uuid: 'r1', timestamp: iso });
+    const r1 = m1.items.find((i) => i.kind === 'result') as ResultItem;
+    expect(r1.at).toBe(Date.parse(iso));
+
+    // 2. Ao vivo sem timestamp no result: preenche com o momento atual
+    const before = Date.now();
+    const m2 = new ChatModel();
+    m2.apply({ type: 'result', subtype: 'success', uuid: 'r2' });
+    const r2 = m2.items.find((i) => i.kind === 'result') as ResultItem;
+    expect(typeof r2.at).toBe('number');
+    expect(r2.at).toBeGreaterThanOrEqual(before);
+    expect(r2.at).toBeLessThanOrEqual(Date.now());
+
+    // 3. No histórico sem timestamp: herda da fala do assistente que encerrou o turno
+    const m3 = new ChatModel();
+    const astIso = '2026-10-15T10:15:30.000Z';
+    m3.apply({ type: 'assistant', uuid: 'a1', timestamp: astIso, message: { id: 'm1', content: [{ type: 'text', text: 'ok' }] } }, { history: true });
+    m3.apply({ type: 'result', subtype: 'success', uuid: 'r3' }, { history: true });
+    const r3 = m3.items.find((i) => i.kind === 'result') as ResultItem;
+    expect(r3.at).toBe(Date.parse(astIso));
+
+    // 4. No histórico totalmente sem timestamp nem assistente: at fica undefined
+    const m4 = new ChatModel();
+    m4.apply({ type: 'result', subtype: 'success', uuid: 'r4' }, { history: true });
+    const r4 = m4.items.find((i) => i.kind === 'result') as ResultItem;
+    expect(r4.at).toBeUndefined();
+  });
+
   it('mostra só aumentos observados entre resultados da mesma conversa, nunca o total como preço do turno', () => {
     const result = (key: string, costUsd?: number): ResultItem => ({ kind: 'result', key, subtype: 'success', isError: false, costUsd });
     const items: Item[] = [
@@ -663,6 +695,54 @@ describe('agentes em execução (indicador ao lado do modelo)', () => {
     });
     expect(m.runningAgents(Date.now() - 60000)).toEqual([]);
     expect(m.agentMap()[0]).toMatchObject({ id: 't1', status: 'killed' });
+  });
+
+  it('queue-operation com task-notification encerra o agente em segundo plano', () => {
+    const m = new ChatModel();
+    m.apply(launch('t1', { description: 'Pesquisa', run_in_background: true }));
+    m.apply(back('t1', { status: 'async_launched', agentId: 'agent-1' }));
+    expect(m.runningAgents(Date.now() - 60000)).toHaveLength(1);
+
+    m.apply({
+      type: 'queue-operation',
+      operation: 'enqueue',
+      content: '<task-notification>\n<task-id>agent-1</task-id>\n<tool-use-id>t1</tool-use-id>\n<status>completed</status>\n<summary>concluído</summary>\n</task-notification>',
+    });
+    expect(m.runningAgents(Date.now() - 60000)).toEqual([]);
+    expect(m.agentMap()[0]).toMatchObject({ id: 't1', status: 'completed' });
+  });
+
+  it('attachment com queued_command contendo task-notification encerra o agente', () => {
+    const m = new ChatModel();
+    m.apply(launch('t1', { description: 'Pesquisa', run_in_background: true }));
+    m.apply(back('t1', { status: 'async_launched', agentId: 'agent-1' }));
+    expect(m.runningAgents(Date.now() - 60000)).toHaveLength(1);
+
+    m.apply({
+      type: 'attachment',
+      attachment: {
+        type: 'queued_command',
+        prompt: '<task-notification>\n<task-id>agent-1</task-id>\n<tool-use-id>t1</tool-use-id>\n<status>completed</status>\n</task-notification>',
+      },
+    });
+    expect(m.runningAgents(Date.now() - 60000)).toEqual([]);
+    expect(m.agentMap()[0]).toMatchObject({ id: 't1', status: 'completed' });
+  });
+
+  it('attachment com task_status encerra a tarefa', () => {
+    const m = new ChatModel();
+    m.apply({ type: 'system', subtype: 'task_started', task_id: 'task-1', description: 'Bash job', task_type: 'local_bash', is_backgrounded: true });
+    expect(m.agentMap().find((a) => a.taskId === 'task-1')).toMatchObject({ status: 'working' });
+
+    m.apply({
+      type: 'attachment',
+      attachment: {
+        type: 'task_status',
+        taskId: 'task-1',
+        status: 'completed',
+      },
+    });
+    expect(m.agentMap().find((a) => a.taskId === 'task-1')).toMatchObject({ status: 'completed' });
   });
 
   it('agente mais antigo que 2 horas é descartado do runningAgents mesmo sem notificação de fim', () => {

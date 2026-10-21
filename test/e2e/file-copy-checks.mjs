@@ -14,6 +14,20 @@ export async function copyItem(w, name, keyboard = false) {
   await w.h.waitText('.toast', `Copiado: ${name}`);
   await sleep(250); // evento do clipboard chega às outras janelas
 }
+/**
+ * Solta no espaço vazio do explorador uma linha arrastada de OUTRA janela do Deck (o que o navegador entrega
+ * ao soltar: só o tipo `application/x-deck-path`). O arrasto real entre duas janelas não é automatizável.
+ */
+export async function dropDeckItem(w, item) {
+  await w.page.bringToFront();
+  await w.page.evaluate((data) => {
+    const dt = new DataTransfer();
+    dt.setData('application/x-deck-path', JSON.stringify(data));
+    dt.setData('text/plain', data.path);
+    const el = document.querySelector('.explorer-fill');
+    for (const type of ['dragenter', 'dragover', 'drop']) el.dispatchEvent(new DragEvent(type, { dataTransfer: dt, bubbles: true, cancelable: true }));
+  }, item);
+}
 export async function pasteRoot(w, keyboard = false) {
   await w.page.bringToFront();
   if (keyboard) { await w.page.focus('.explorer-body .section-head'); await w.h.hotkey('Control', 'v'); }

@@ -181,6 +181,18 @@ describe('terminal MCP validation', () => {
     expect(call).not.toHaveBeenCalled();
   });
 
+  it.each(['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'])('initialize accepts the supported protocol version %s as proposed', async (requested) => {
+    const server = new TerminalMcpServer({ call: vi.fn() });
+    const response = await server.handle({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: requested } });
+    expect(response.result.protocolVersion).toBe(requested);
+  });
+
+  it.each([['2026-07-28'], ['1999-01-01'], [undefined], [42], [null]])('initialize does not echo an unsupported protocol version (%s)', async (requested) => {
+    const server = new TerminalMcpServer({ call: vi.fn() });
+    const response = await server.handle({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: requested } });
+    expect(response.result.protocolVersion).toBe('2025-11-25');
+  });
+
   it('lists tools and rejects unknown methods', async () => {
     const server = new TerminalMcpServer({ call: vi.fn() });
     expect((await server.handle({ jsonrpc: '2.0', id: 1, method: 'tools/list' })).result.tools.map((t: any) => t.name)).toEqual(['run', 'send', 'read', 'wait']);

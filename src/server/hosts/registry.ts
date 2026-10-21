@@ -2,7 +2,7 @@
 import { EventEmitter } from 'node:events';
 import crypto from 'node:crypto';
 import os from 'node:os';
-import type { HostInfo, HostStatus, Platform } from '../../shared/types';
+import type { ClaudeUpdateResult, HostInfo, HostStatus, Platform } from '../../shared/types';
 import { LOCAL_HOST_ID } from '../../shared/types';
 import { DeckError } from '../../shared/protocol';
 import { listEntries, loadSshConfig, resolveHost } from './sshconfig';
@@ -13,6 +13,9 @@ import type { HostFs } from '../fs/hostfs';
 import { LocalFs } from '../fs/localfs';
 import { SftpFs } from '../fs/sftpfs';
 import { findLocalClaude } from '../claude/find-local';
+import { LatestClaude } from '../claude/latest';
+import { buildUpdateCommand, classifyClaudeBin, parseUpdateOutput } from '../claude/update';
+import { isNewerVersion, isPlainVersion } from '../../shared/version';
 import runnerScript from '../claude/runner.sh';
 
 export const RUNNER_HASH = crypto.createHash('sha1').update(runnerScript).digest('hex').slice(0, 10);
@@ -26,6 +29,17 @@ export interface HostHandle {
   platform: Platform;
   fs: HostFs;
   ssh?: SshHost;
+}
+
+/** Espera `p` por no máximo `ms` (não rejeita nem cancela `p`). */
+function waitUpTo(p: Promise<unknown>, ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    p.then(() => {
+      clearTimeout(t);
+      resolve();
+    });
+  });
 }
 
 const COLORS = ['#4fc1ff', '#c586c0', '#4ec9b0', '#dcdcaa', '#ce9178', '#b5cea8', '#d7ba7d', '#9cdcfe', '#f48771', '#89d185', '#e2c08d', '#75beff'];
@@ -45,6 +59,14 @@ export class HostRegistry extends EventEmitter {
   private runnerReady = new Set<string>();
   private installing = new Map<string, Promise<void>>();
   readonly localFs = new LocalFs();
+  /** Versão mais nova do Claude Code (npm), consultada pelo Deck e guardada em cache. */
+  readonly latest = new LatestClaude();
+  /**
+   * Servidores onde o `claude update` terminou sem achar nada mais novo (canal "stable", por exemplo), com a versão
+   * em que estavam: enquanto continuarem nela, o aviso de atualização não volta.
+   */
+  private noNewer = new Map<string, string>();
+  private updating = new Map<string, Promise<ClaudeUpdateResult>>();
 
   constructor(
     private store: Store,
@@ -123,8 +145,21 @@ export class HostRegistry extends EventEmitter {
   status(id: string): HostStatus {
     const st = this.statuses.get(id) ?? { id, state: 'idle' };
     const h = this.handles.get(id);
-    if (h?.ssh) return { ...st, channels: h.ssh.channelCount, connections: h.ssh.connectionCount };
-    return st;
+    const out: HostStatus = h?.ssh ? { ...st, channels: h.ssh.channelCount, connections: h.ssh.connectionCount } : { ...st };
+    const latest = this.updatableLatest(id, st);
+    if (latest) out.claudeLatest = latest;
+    else delete out.claudeLatest; // calculado a cada vez: nunca herda um valor antigo guardado em `statuses`
+    return out;
+  }
+
+  /** Versão a oferecer como atualização: só SSH, só se for maior, e só onde o `claude update` pode agir. */
+  private updatableLatest(id: string, st: HostStatus): string | undefined {
+    if (id === LOCAL_HOST_ID || !st.claude) return undefined;
+    const latest = this.latest.current;
+    if (!isNewerVersion(latest, st.claude.version)) return undefined;
+    if (this.noNewer.get(id) === st.claude.version) return undefined;
+    if (classifyClaudeBin(st.claude.path) === 'extension') return undefined; // quem atualiza é o editor
+    return latest;
   }
 
   allStatuses(): HostStatus[] {
@@ -149,6 +184,8 @@ export class HostRegistry extends EventEmitter {
     if (pending) return pending;
     const p = (async () => {
       const ssh = h.ssh!;
+      // A pergunta "qual a versão mais nova?" sai daqui, em paralelo com o SSH: não custa comando no servidor.
+      const latestLookup = this.latest.ensure();
       await ssh.ensure();
       const probe = await ssh.run(
         `printf 'HOME=%s\\n' "$HOME"; uname -s | sed 's/^/OS=/'; [ -f "$HOME/${RUNNER_REL}" ] && echo RUNNER=ok || echo RUNNER=missing`,
@@ -173,7 +210,14 @@ export class HostRegistry extends EventEmitter {
         claude: chosen,
         claudeCandidates: bins,
       };
+      // Dá um instante para a consulta terminar, para o primeiro status já levar o aviso. Se demorar, o aviso
+      // chega num segundo status quando ela acabar (a conexão nunca fica esperando a internet).
+      await waitUpTo(latestLookup, 1500);
       this.updateStatus(id, st);
+      const shown = this.status(id).claudeLatest;
+      void latestLookup.then(() => {
+        if (this.statuses.get(id)?.state === 'ready' && this.status(id).claudeLatest !== shown) this.emit('status', this.status(id));
+      });
       return this.status(id);
     })()
       .catch((e) => {
@@ -230,7 +274,7 @@ export class HostRegistry extends EventEmitter {
    * Teste de conexão sem interação (não pede senha nem confirma chave nova) e só de leitura.
    * Se o servidor não estava conectado antes, desconecta no fim.
    */
-  async check(id: string): Promise<{ ok: boolean; ms: number; error?: string; claude?: { path: string; version: string } | null }> {
+  async check(id: string): Promise<{ ok: boolean; ms: number; error?: string; claude?: { path: string; version: string } | null; claudeLatest?: string }> {
     const h = this.get(id);
     if (!h.ssh) return { ok: true, ms: 0 };
     const ssh = h.ssh;
@@ -239,7 +283,7 @@ export class HostRegistry extends EventEmitter {
     const t0 = Date.now();
     try {
       const st = await this.connect(id, true);
-      return { ok: true, ms: Date.now() - t0, claude: st.claude ?? null };
+      return { ok: true, ms: Date.now() - t0, claude: st.claude ?? null, claudeLatest: st.claudeLatest };
     } catch (e) {
       return { ok: false, ms: Date.now() - t0, error: (e as Error).message };
     } finally {
@@ -247,6 +291,55 @@ export class HostRegistry extends EventEmitter {
       // Conectou só para o teste: fecha, mas guarda o que descobriu. Se falhou, o erro fica visível.
       if (!wasConnected && ssh.connected) this.disconnect(id, true);
     }
+  }
+
+  /**
+   * Atualiza o Claude Code do servidor rodando o `claude update` do próprio binário. É o ÚNICO caminho do Deck que
+   * grava no servidor além do runner, e só roda quando o usuário pede. Duas chamadas ao mesmo tempo viram uma.
+   * O resultado é julgado pela versão depois da atualização, não pelo texto que o comando imprimiu.
+   */
+  updateClaude(id: string): Promise<ClaudeUpdateResult> {
+    if (id === LOCAL_HOST_ID) {
+      return Promise.reject(new DeckError('local', 'O Claude Code deste computador não é atualizado pelo Deck (no Windows o programa em uso não pode ser trocado). Atualize pelo npm ou pelo instalador.'));
+    }
+    const running = this.updating.get(id);
+    if (running) return running;
+    const p = this.doUpdateClaude(id).finally(() => this.updating.delete(id));
+    this.updating.set(id, p);
+    return p;
+  }
+
+  private async doUpdateClaude(id: string): Promise<ClaudeUpdateResult> {
+    const claude = (await this.connect(id)).claude;
+    if (!claude) throw new DeckError('noclaude', `Claude Code não encontrado em ${id}. Instale com: curl -fsSL https://claude.ai/install.sh | bash`);
+    if (classifyClaudeBin(claude.path) === 'extension') {
+      throw new DeckError('managed', `O Claude Code de ${id} vem da extensão do VS Code/Cursor instalada nele (${claude.path}). Atualize a extensão lá.`);
+    }
+    const before = claude.version;
+    const ssh = this.get(id).ssh!;
+    this.log(`[${id}] claude update: ${before} → atualizando com ${claude.path}`);
+    let stdout: string;
+    try {
+      stdout = (await ssh.run(buildUpdateCommand(claude.path), { timeoutMs: 300_000, maxBytes: 256 * 1024 })).stdout;
+    } catch (e) {
+      if ((e as DeckError).code === 'timeout') throw new DeckError('update', `A atualização em ${id} passou de 5 minutos e foi interrompida. Confira por ssh se o Claude Code ficou inteiro (claude --version).`);
+      throw e;
+    }
+    const out = parseUpdateOutput(stdout);
+    const after = (await this.connect(id, true)).claude?.version ?? before;
+    const changed = isNewerVersion(after, before) || (!isPlainVersion(before) && isPlainVersion(after));
+    this.log(`[${id}] claude update: ${before} → ${after} (saída ${out.exit ?? 'sem código'})`);
+    if (changed) {
+      this.noNewer.delete(id);
+      return { before, after, latest: this.latest.current, changed: true, output: out.tail };
+    }
+    if (out.exit === 0) {
+      // Rodou sem erro e não achou nada mais novo no canal deste servidor: não insistir com o aviso.
+      if (isNewerVersion(this.latest.current, before)) this.noNewer.set(id, before);
+      this.emit('status', this.status(id));
+      return { before, after, latest: this.latest.current, changed: false, output: out.tail };
+    }
+    throw new DeckError('update', out.tail || `O "claude update" terminou com erro${out.exit != null ? ` (código ${out.exit})` : ''} e a versão não mudou.`);
   }
 
   /** Lista os binários do Claude no servidor (maior versão primeiro), sem gravar nada lá. */
@@ -268,9 +361,49 @@ export class HostRegistry extends EventEmitter {
     return bins.sort((a, b) => cmp(a.version, b.version));
   }
 
+  /** Folga antes de soltar um servidor sem uso: fechar uma aba e abrir outra do mesmo servidor não custa novo login. */
+  static readonly RELEASE_GRACE_MS = 10_000;
+  /** Quantas vezes repete a conferência quando só há uso passageiro (com a folga de 10 s: cerca de 1 minuto). */
+  static readonly RELEASE_RETRIES = 6;
+  private releaseTimers = new Map<string, NodeJS.Timeout>();
+
+  /**
+   * Chamado quando uma aba (conversa/terminal) do servidor foi fechada: se depois de uma folga nada mais
+   * usar a conexão SSH, ela é fechada. Quem precisar do servidor depois reconecta sozinho (connect/fsFor).
+   * `inUse` diz se há abas ou cópias que dependem dele; canais abertos e usos longos o SshHost já sabe.
+   */
+  releaseWhenIdle(id: string, inUse: () => boolean, graceMs = HostRegistry.RELEASE_GRACE_MS, attempt = 0) {
+    const ssh = this.handles.get(id)?.ssh;
+    if (!ssh) return;
+    clearTimeout(this.releaseTimers.get(id));
+    const timer = setTimeout(() => {
+      this.releaseTimers.delete(id);
+      // Reconferido só agora: durante a folga o usuário pode ter aberto outra aba.
+      if (!ssh.connected || inUse()) return; // aba/cópia voltou: o próximo fechamento pede de novo
+      // Sem aba, mas com algo passageiro no ar (leitura de transcrito, comando, conexão abrindo): desistir aqui
+      // deixaria a conexão aberta para sempre. Tenta de novo logo, num número limitado de vezes.
+      if (this.connecting.has(id) || ssh.busy) {
+        if (attempt < HostRegistry.RELEASE_RETRIES) this.releaseWhenIdle(id, inUse, graceMs, attempt + 1);
+        return;
+      }
+      this.log(`[${id}] sem abas nem transferências: fechando a conexão SSH`);
+      this.disconnect(id, true);
+    }, graceMs);
+    timer.unref();
+    this.releaseTimers.set(id, timer);
+  }
+
+  private clearReleaseTimer(id: string) {
+    const t = this.releaseTimers.get(id);
+    if (!t) return;
+    clearTimeout(t);
+    this.releaseTimers.delete(id);
+  }
+
   disconnect(id: string, keepInfo = false) {
     const h = this.handles.get(id);
     if (h?.ssh) {
+      this.clearReleaseTimer(id);
       h.ssh.close();
       this.prompts.cancelHost(id);
       const cur = this.statuses.get(id);
@@ -287,6 +420,7 @@ export class HostRegistry extends EventEmitter {
   }
 
   closeAll() {
+    for (const id of [...this.releaseTimers.keys()]) this.clearReleaseTimer(id);
     for (const h of this.handles.values()) h.ssh?.close();
   }
 }

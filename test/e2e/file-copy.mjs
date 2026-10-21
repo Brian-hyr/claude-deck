@@ -4,8 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { startEnv, helpers, SANDBOX, ROOT } from './harness.mjs';
-import { copyItem, latestCopy, pasteRoot, runFileCopyChecks } from './file-copy-checks.mjs';
+import { startEnv, helpers, SANDBOX, ROOT, sleep } from './harness.mjs';
+import { copyItem, dropDeckItem, latestCopy, pasteRoot, runFileCopyChecks } from './file-copy-checks.mjs';
 
 const remote = process.argv.includes('--remote');
 const HOST = process.env.DECK_TEST_HOST || 'srv-teste';
@@ -86,6 +86,32 @@ try {
       h.assert(ssh(`find '${base}' -name '.deck-copy-*' | wc -l`).trim() === '0', 'sobrou temporário de cópia');
       await B.page.screenshot({ path: path.join(shots, 'sftp-duas-janelas.png') });
       console.log('OK: local→SSH→SSH→local com SHA-256, alias equivalente bloqueado e substituição SFTP');
+
+      // Arrastar uma linha da janela de outro servidor e soltar aqui: copia (com confirmação), nunca move.
+      const clip = await h.rpc('fileClipboard.get', {}).catch(() => null);
+      const readme = fs.readFileSync(path.join(env.sandbox, 'README.md'), 'utf8');
+      await dropDeckItem(A, { hostId: 'local', path: path.join(env.sandbox, 'README.md'), dir: false });
+      await A.h.waitText('.dialog .dialog-head', `Copiar README.md para`);
+      await A.h.waitText('.dialog .dialog-body', 'o original continua onde está');
+      await A.h.clickText('.dialog .dialog-foot .btn', 'Copiar', true);
+      await latestCopy(A, 'Concluída', 60000); await A.page.keyboard.press('Escape');
+      h.assert(ssh(`cat '${base}/A/README.md'`) === readme, 'arrasto local→SSH: conteúdo errado');
+      h.assert(fs.existsSync(path.join(env.sandbox, 'README.md')), 'arrasto local→SSH apagou a origem');
+      await A.h.findTreeRow('README.md');
+      await dropDeckItem(L, { hostId: HOST, path: `${base}/A/sub`, dir: true });
+      await L.h.waitText('.dialog .dialog-head', 'Copiar sub para');
+      await L.h.clickText('.dialog .dialog-foot .btn', 'Cancelar', true);
+      await sleep(500);
+      h.assert(!fs.existsSync(path.join(env.uploads, 'sub')), 'cancelar o arrasto não deveria copiar');
+      await dropDeckItem(L, { hostId: HOST, path: `${base}/A/README.md`, dir: false });
+      await L.h.waitText('.dialog .dialog-head', 'Copiar README.md para');
+      await L.h.clickText('.dialog .dialog-foot .btn', 'Copiar', true);
+      await latestCopy(L, 'Concluída', 60000); await L.page.keyboard.press('Escape');
+      h.assert(fs.readFileSync(path.join(env.uploads, 'README.md'), 'utf8') === readme, 'arrasto SSH→local: conteúdo errado');
+      h.assert(ssh(`test -f '${base}/A/README.md' && echo sim`).trim() === 'sim', 'arrasto SSH→local apagou a origem');
+      h.assert(JSON.stringify(await h.rpc('fileClipboard.get', {}).catch(() => null)) === JSON.stringify(clip), 'arrastar não pode trocar o item copiado (Ctrl+C)');
+      await L.page.screenshot({ path: path.join(shots, 'arrasto-entre-servidores.png') });
+      console.log('OK: arrastar entre servidores copia local→SSH e SSH→local, cancelar não copia, origem e clipboard intactos');
     } finally { for (const p of windows) await p.close().catch(() => {}); }
   }
   if (env.app.errors.length) throw new Error(env.app.errors.join('\n'));

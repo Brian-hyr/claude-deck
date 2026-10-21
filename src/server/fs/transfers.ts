@@ -39,12 +39,17 @@ export class FileTransfers {
   constructor(private opts: TransferOptions) {}
 
   get busy() { return [...this.runs.values()].filter((r) => !COPY_TERMINAL.has(r.job.state)).length; }
-  setClipboard(wid: string, hostId: string, p: unknown) {
-    if (this.stopped) throw new DeckError('busy', 'Servidor encerrando.');
+  /** Origem válida de uma cópia: caminho absoluto, normalizado, com nome aceitável. */
+  private origin(hostId: string, p: unknown) {
     const platform = this.opts.platform(hostId);
     const path = copyPath(platform, p);
     const name = path.split(platform === 'win32' ? /[\\/]/ : /\//).pop() || '';
     copyName(platform, name);
+    return { path, name };
+  }
+  setClipboard(wid: string, hostId: string, p: unknown) {
+    if (this.stopped) throw new DeckError('busy', 'Servidor encerrando.');
+    const { path, name } = this.origin(hostId, p);
     this.sourceWid = wid;
     this.clipboard = { id: crypto.randomUUID(), revision: ++this.clipboardRevision, hostId, path, name };
     this.opts.clipboard(this.clipboard);
@@ -62,10 +67,16 @@ export class FileTransfers {
     if (!r || (r.wid !== wid && r.sourceWid !== wid)) throw new DeckError('notfound', 'Cópia não encontrada nesta janela.');
     return r;
   }
-  start(wid: string, p: { requestId: string; clipboardId: string; revision: number; hostId: string; dir: string }) {
+  /**
+   * Colar (origem = clipboard do daemon) ou soltar um item arrastado de outra janela (`source` explícito:
+   * não mexe no clipboard que o usuário copiou antes).
+   */
+  start(wid: string, p: { requestId: string; clipboardId?: string; revision?: number; hostId: string; dir: string; source?: { hostId: string; path: string } }) {
     if (this.stopped) throw new DeckError('busy', 'Servidor encerrando.');
     if (typeof p.requestId !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(p.requestId)) throw new DeckError('bad', 'Identificador de colagem inválido.');
-    const signature = JSON.stringify([p.clipboardId, p.revision, p.hostId, p.dir]);
+    const dragged = p.source !== undefined;
+    if (dragged && (typeof p.source !== 'object' || p.source === null || typeof p.source.hostId !== 'string')) throw new DeckError('bad', 'Origem da cópia inválida.');
+    const signature = JSON.stringify(dragged ? ['drag', p.source!.hostId, p.source!.path, p.hostId, p.dir] : [p.clipboardId, p.revision, p.hostId, p.dir]);
     const prev = this.requests.get(`${wid}:${p.requestId}`);
     if (prev) {
       const r = this.owned(wid, prev);
@@ -74,16 +85,21 @@ export class FileTransfers {
     }
     if (this.requests.size >= 10_000) throw new DeckError('busy', 'Limite de pedidos de cópia nesta execução. Atualize/reinicie o Deck quando estiver ocioso.');
     if (this.busy >= 10) throw new DeckError('busy', 'Há muitas cópias pendentes; termine ou cancele as anteriores.');
-    const c = this.clipboard;
-    if (!c || c.id !== p.clipboardId || c.revision !== p.revision) throw new DeckError('conflict', 'O item copiado mudou. Copie novamente antes de colar.');
+    let source: { hostId: string; path: string };
+    if (dragged) source = { hostId: p.source!.hostId, path: this.origin(p.source!.hostId, p.source!.path).path };
+    else {
+      const c = this.clipboard;
+      if (!c || c.id !== p.clipboardId || c.revision !== p.revision) throw new DeckError('conflict', 'O item copiado mudou. Copie novamente antes de colar.');
+      source = { hostId: c.hostId, path: c.path };
+    }
     const path = copyPath(this.opts.platform(p.hostId), p.dir);
     const job: FileCopyJob = {
       id: crypto.randomUUID(), requestId: p.requestId, destinationWid: wid, revision: 0,
-      source: { hostId: c.hostId, path: c.path }, destination: { hostId: p.hostId, path },
+      source, destination: { hostId: p.hostId, path },
       state: 'scanning', createdAt: Date.now(), files: 0, directories: 0, bytes: 0, transferred: 0,
       copied: 0, skipped: 0, omitted: 0, conflicts: 0, issueCount: 0, issues: [],
     };
-    const r: Run = { job, wid, sourceWid: this.sourceWid, entries: [], controller: new AbortController(), policy: 'skip', signature, lastEmit: 0, issues: [] };
+    const r: Run = { job, wid, sourceWid: dragged ? wid : this.sourceWid, entries: [], controller: new AbortController(), policy: 'skip', signature, lastEmit: 0, issues: [] };
     this.runs.set(job.id, r);
     this.requests.set(`${wid}:${p.requestId}`, job.id);
     this.emit(r);

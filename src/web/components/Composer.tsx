@@ -14,6 +14,7 @@ import {
   toggleChatExecutionMode,
   settings,
   toast,
+  openContextModal,
   platformOf,
   type ChatTab,
 } from '../lib/state';
@@ -23,7 +24,7 @@ import { Icon } from './icons';
 import { openMenu } from './ContextMenu';
 import { fuzzyScore } from '../lib/format';
 import { cachePillLabel, cacheTooltip, cacheWindowAt } from '../lib/promptCache';
-import { compactAction, contextAriaLabel, contextMeter, contextTooltip, contextUnknownTooltip, pieStroke } from '../lib/contextUsage';
+import { contextAriaLabel, contextMeter, contextTooltip, contextUnknownTooltip, pieStroke } from '../lib/contextUsage';
 import { basename, relativeTo } from '../../shared/paths';
 
 export const MODE_LABELS: Record<PermissionMode, { label: string; icon: string; desc: string }> = {
@@ -79,43 +80,22 @@ function agentsTooltip(agents: AgentRun[]): string {
   return `${agents.length === 1 ? '1 agente em execução' : `${agents.length} agentes em execução`}\n${lines.join('\n')}`;
 }
 
-/**
- * Uso do contexto (a "pizza" da extensão do Claude Code), sempre visível: a dica mostra o uso e a janela do modelo;
- * clicar manda `/compact` direto no chat, sem confirmação. Enquanto a janela não é conhecida
- * (conversa nova ou reaberta, antes do primeiro turno terminar) o anel fica vazio, mas o clique continua valendo.
- * Com o Claude trabalhando o clique não compacta no meio do turno: manda o `/compact` do mesmo jeito, e o Claude Code
- * o deixa na fila dele e o roda quando o turno termina (como a extensão do VS Code: o clique chama o mesmo envio de
- * mensagem). Um segundo clique não enfileira outro `/compact`: só avisa que já está na fila.
- */
-function ContextPie({ c, running }: { c: ChatTab; running: boolean }) {
+/** A pizza sempre visível abre o detalhamento; compactar exige o botão explícito no modal. */
+function ContextPie({ c }: { c: ChatTab }) {
   void c.version.value; // mensagem nova / resultado do turno → uso novo
   const usage = c.model.contextUsage;
   const m = contextMeter(usage);
   const { radius, circumference, filled } = pieStroke(m?.percentUsed ?? 0);
-  const action = compactAction(running, c.model.compactState());
-  const compact = () => {
-    if (action === 'queued') {
-      toast('O /compact já está na fila: roda quando o Claude terminar o que está fazendo.', 'info');
-      return;
-    }
-    if (action === 'compacting') {
-      toast('O Claude já está compactando.', 'info');
-      return;
-    }
-    if (action === 'enqueue') toast('/compact na fila: roda quando o Claude terminar o que está fazendo.', 'info');
-    void sendMessage(c, '/compact', []);
-  };
   return (
     <button
       class="ctx-pie"
       type="button"
-      title={m ? contextTooltip(m, action) : contextUnknownTooltip(usage, action)}
-      aria-label={contextAriaLabel(m, action)}
-      data-compact={action === 'queued' || action === 'compacting' ? action : undefined}
+      title={m ? contextTooltip(m) : contextUnknownTooltip(usage)}
+      aria-label={contextAriaLabel(m)}
       data-context-state={m ? 'known' : 'unknown'}
       data-context-basis={m?.basis}
       data-context-percent={m ? Math.round(m.percentUsed) : undefined}
-      onClick={compact}
+      onClick={() => openContextModal(c.sid)}
     >
       <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true" style={{ display: 'block' }}>
         <circle cx="10" cy="10" r={radius} stroke="currentColor" stroke-opacity="0.15" stroke-width="1.5" />
@@ -421,7 +401,9 @@ export function Composer({ c }: { c: ChatTab }) {
             await rpc.call('sessions.stopTask', { sid: c.sid, taskId: a.taskId });
           } catch {}
         }
+        c.model.finishTask(a.taskId, a.id, 'killed');
       }
+      c.version.value++;
     }
   };
 
@@ -491,7 +473,9 @@ export function Composer({ c }: { c: ChatTab }) {
   useEffect(() => {
     if (pendingCount) setAgentsOpen(false);
   }, [pendingCount]);
-  const effortBusy = running || pendingCount > 0 || !['idle', 'dormant'].includes(st.phase);
+  // O esforço vale na hora, até no meio de uma tarefa (o CLI aplica na próxima chamada ao modelo).
+  // Só espera enquanto o Claude conecta ou se não há processo para receber a mudança.
+  const effortBusy = ['starting', 'reconnecting', 'error', 'ended'].includes(st.phase);
   const effortLabel = st.effort ? EFFORT_LABELS[st.effort] : 'Padrão';
 
   return (
@@ -625,7 +609,7 @@ export function Composer({ c }: { c: ChatTab }) {
                   .map((m) => ({ label: `${m.displayName}${st.model === m.value ? '  ✓' : ''}`, icon: 'hubot', action: () => setChatModel(c, m.value) })),
                 ...(!models.length ? [{ label: 'Lista de modelos aparece após o Claude iniciar', icon: 'info', disabled: true }] : []),
                 { separator: true },
-                { label: effortBusy ? 'Nível de esforço (aguarde o fim da tarefa)' : 'Nível de esforço', icon: 'info', disabled: true },
+                { label: effortBusy ? 'Nível de esforço (aguarde o Claude conectar)' : 'Nível de esforço', icon: 'info', disabled: true },
                 { label: `Padrão do Claude Code${!st.effort ? '  ✓' : ''}`, icon: 'circle-large-outline', disabled: effortBusy, action: () => setChatEffort(c, null) },
                 ...(Object.entries(EFFORT_LABELS) as [EffortLevel, string][]).map(([value, label]) => ({
                   label: `${label}${st.effort === value ? '  ✓' : ''}`,
@@ -643,7 +627,7 @@ export function Composer({ c }: { c: ChatTab }) {
               <Icon name={taskCount ? 'loading' : 'hubot'} class={taskCount ? 'spin' : ''} style={{ fontSize: 13 }} /> {agents.length ? `${agents.length} ${agents.length === 1 ? 'agente' : 'agentes'}` : 'Agentes'}
             </button>
           )}
-          <ContextPie c={c} running={running} />
+          <ContextPie c={c} />
           <CachePill c={c} />
           {fileCtx && (
             <button

@@ -68,6 +68,7 @@ class SftpRangeStream extends Readable {
     private h: Buffer,
     start: number,
     private end: number,
+    private release: () => void = () => {},
   ) {
     super({ highWaterMark: 1024 * 1024 });
     this.pos = start;
@@ -99,7 +100,10 @@ class SftpRangeStream extends Readable {
   }
   _destroy(err: Error | null, cb: (e?: Error | null) => void) {
     this.done = true;
-    this.s.close(this.h, () => cb(err));
+    this.s.close(this.h, () => {
+      this.release();
+      cb(err);
+    });
   }
 }
 
@@ -261,17 +265,23 @@ export class SftpFs implements HostFs {
   }
 
   private async withHandle<T>(p: string, flags: 'r' | 'w', fn: (s: SFTPWrapper, h: Buffer) => Promise<T>): Promise<T> {
-    const s = await this.sftp();
-    let h: Buffer;
+    // Leitura/gravação de arquivo grande pode demorar: a conexão não pode ser solta no meio.
+    const release = this.host.hold();
     try {
-      h = await p2<Buffer>((cb) => s.open(p, flags as any, cb as any));
-    } catch (e) {
-      throw friendly(e, p);
-    }
-    try {
-      return await fn(s, h);
+      const s = await this.sftp();
+      let h: Buffer;
+      try {
+        h = await p2<Buffer>((cb) => s.open(p, flags as any, cb as any));
+      } catch (e) {
+        throw friendly(e, p);
+      }
+      try {
+        return await fn(s, h);
+      } finally {
+        await p2<void>((cb) => s.close(h, cb as any)).catch(() => {});
+      }
     } finally {
-      await p2<void>((cb) => s.close(h, cb as any)).catch(() => {});
+      release();
     }
   }
 
@@ -297,19 +307,34 @@ export class SftpFs implements HostFs {
   }
 
   async createReadStream(p: string, start: number, end: number): Promise<Readable> {
-    const s = await this.sftp();
-    let h: Buffer;
+    // O uso dura até o fluxo ser destruído (fim do arquivo, navegador cancelou ou erro).
+    const release = this.host.hold();
     try {
-      h = await p2<Buffer>((cb) => s.open(p, 'r', cb as any));
+      const s = await this.sftp();
+      let h: Buffer;
+      try {
+        h = await p2<Buffer>((cb) => s.open(p, 'r', cb as any));
+      } catch (e) {
+        throw friendly(e, p);
+      }
+      return new SftpRangeStream(s, h, start, end, release);
     } catch (e) {
-      throw friendly(e, p);
+      release();
+      throw e;
     }
-    return new SftpRangeStream(s, h, start, end);
   }
 
   async createWriteStream(p: string): Promise<Writable> {
-    const s = await this.sftp();
-    return s.createWriteStream(p) as unknown as Writable;
+    const release = this.host.hold();
+    try {
+      const s = await this.sftp();
+      const stream = s.createWriteStream(p) as unknown as Writable;
+      stream.once('close', release);
+      return stream;
+    } catch (e) {
+      release();
+      throw e;
+    }
   }
 
   async write(p: string, data: Buffer, opts: { expectedMtime?: number; expectedSize?: number; createOnly?: boolean } = {}) {

@@ -1,5 +1,5 @@
 // Barra de status (embaixo), no estilo do VS Code.
-import { activeChat, activeFile, chats, connectHost, hostLabel, hostStatus, newChatPicker, settings, sidebarView, sidebarVisible, stats, toast, toggleTerminal, updateSettings, uploadProgress, workspace } from '../lib/state';
+import { activeChat, activeFile, chats, claudeUpdateOffer, connectHost, hostLabel, hostStatus, newChatPicker, settings, sidebarView, sidebarVisible, stats, toast, toggleTerminal, updateHostClaude, updateSettings, updatingClaude, uploadProgress, workspace } from '../lib/state';
 import { wsConnected } from '../lib/rpc';
 import { copyTerminal, fileCopyJobs, fileCopyLabel, fileCopyPanel } from '../lib/fileCopy';
 import { Icon } from './icons';
@@ -30,6 +30,8 @@ export function StatusBar() {
   const hostId = c?.state.value.hostId ?? workspace.value?.hostId ?? 'local';
   const st = hostStatus.value[hostId];
   const remote = hostId !== 'local';
+  const offer = claudeUpdateOffer(hostId);
+  const updating = updatingClaude.value.has(hostId);
   const cls = !remote ? 'local' : st?.state === 'error' ? 'error' : st?.state === 'connecting' || st?.state === 'reconnecting' ? 'connecting' : '';
   // Assina a versão de cada conversa e o recarregamento do arquivo ativo (campos não-signal).
   for (const x of chats.value) void x.version.value;
@@ -64,7 +66,18 @@ export function StatusBar() {
           <Icon name="debug-disconnect" /> Sem conexão com o servidor local
         </span>
       )}
-      {remote && st?.claude && <span class="sb-item" title={st.claude.path}>Claude {st.claude.version}</span>}
+      {remote && st?.claude && !offer && <span class="sb-item" title={st.claude.path}>Claude {st.claude.version}</span>}
+      {remote && st?.claude && offer && (
+        <span
+          class={`sb-item click sb-warn sb-claude-update${updating ? ' busy' : ''}`}
+          role="button"
+          aria-disabled={updating}
+          title={`${st.claude.path}\nHá uma versão mais nova do Claude Code (${offer.to}). Clique para atualizar este servidor.`}
+          onClick={() => void updateHostClaude(hostId)}
+        >
+          <Icon name={updating ? 'loading' : 'arrow-circle-up'} class={updating ? 'spin' : ''} /> Claude {offer.from} → {offer.to} · {updating ? 'Atualizando…' : 'Atualizar'}
+        </span>
+      )}
       {remote && st?.state === 'ready' && st.claude === null && (
         <span class="sb-item sb-warn">
           <Icon name="warning" /> Claude não encontrado no servidor

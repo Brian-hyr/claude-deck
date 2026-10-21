@@ -2,15 +2,17 @@
 import { batch, computed, effect, signal, type Signal } from '@preact/signals';
 import { rpc, RpcError } from './rpc';
 import { ChatModel, type ImageData } from './chatModel';
-import { autoCompactFromResponse } from './contextUsage';
+import { autoCompactFromResponse, type DetailedContextUsage, parseDetailedContextUsage } from './contextUsage';
 import { isFilePublishing, reportFileEdits, syncFileCopies, wireFileCopies } from './fileCopy';
 import {
   DEFAULT_SETTINGS,
   LOCAL_HOST_ID,
+  type ClaudeUpdateResult,
   type HostInfo,
   type HostStatus,
   type EffortLevel,
   type PersistedChatTab,
+  type PinnedMessage,
   type PermissionMode,
   type SessionCapabilities,
   type SessionState,
@@ -21,6 +23,7 @@ import {
 import type { AuthPrompt } from '../../shared/protocol';
 import { basename, dirname, extname, normalize, relativeTo, tildify } from '../../shared/paths';
 import { decodeOpen } from '../../shared/openwin';
+import { isNewerVersion } from '../../shared/version';
 import { activityPrefix, chatActivity } from './activity';
 import { lastActivityOf, scheduleTabSort, sortTabs } from './tabOrder';
 
@@ -163,6 +166,8 @@ export const expandedDirs = signal<Record<string, string[]>>({});
 export const extraRoots = signal<Record<string, string[]>>({});
 /** Raízes do explorador minimizadas pelo usuário (chave hostId:root). */
 export const collapsedRoots = signal<Record<string, boolean>>({});
+/** Colunas de tamanho e data nas linhas do explorador. Escondidas por padrão. */
+export const explorerDetails = signal(false);
 export const explorerRefresh = signal(0);
 export const ready = signal(false);
 /** Terminal integrado (à direita ou embaixo, conforme settings.terminalPosition). */
@@ -184,8 +189,8 @@ const pendingKey = (hostId: string, sessionId: string) => JSON.stringify([hostId
 export function isPending(hostId: string, sessionId?: string): boolean {
   return !!sessionId && !!pendingConversations.value[pendingKey(hostId, sessionId)];
 }
-export function pendingCountFor(hostId: string): number {
-  return Object.values(pendingConversations.value).filter((p) => p.hostId === hostId).length;
+export function pendingCountFor(hostId: string, cwd?: string): number {
+  return Object.values(pendingConversations.value).filter((p) => p.hostId === hostId && (!cwd || sameFolder(hostId, p.cwd, cwd))).length;
 }
 
 async function refreshPending(hostId: string) {
@@ -226,6 +231,92 @@ export async function setConversationPending(hostId: string, sessionId: string |
   })();
   pendingOps.set(key, task);
   void task.finally(() => { if (pendingOps.get(key) === task) pendingOps.delete(key); });
+  return task;
+}
+
+// ------------------------------------------------------------------ mensagens fixadas
+// Só marcadores de leitura: fixar nunca escreve na caixa de mensagem, no transcript nem no contexto do Claude.
+
+export const pinsSupported = signal(false);
+/** Fixadas por conversa (chave composta de servidor e sessão), na ordem em que foram fixadas. */
+export const pinnedMessages = signal<Record<string, PinnedMessage[]>>({});
+const pinOps = new Map<string, Promise<boolean>>();
+const pinsKey = (hostId: string, sessionId: string) => JSON.stringify([hostId, sessionId]);
+
+export function pinsFor(hostId: string, sessionId?: string): PinnedMessage[] {
+  return sessionId ? (pinnedMessages.value[pinsKey(hostId, sessionId)] ?? []) : [];
+}
+export function isPinned(hostId: string, sessionId: string | undefined, anchor: string | undefined): boolean {
+  return !!anchor && pinsFor(hostId, sessionId).some((p) => p.anchor === anchor);
+}
+
+/**
+ * Pedido para rolar a conversa até uma mensagem. Quem pede (lista de fixadas) e quem atende (o `Chat`, que
+ * tem a área de rolagem) ficam desacoplados; `n` muda a cada pedido, então pedir a mesma mensagem de novo vale.
+ */
+export const messageJump = signal<{ sid: string; anchor: string; n: number } | null>(null);
+let messageJumpSeq = 0;
+export function jumpToMessage(sid: string, anchor: string) {
+  messageJump.value = { sid, anchor, n: ++messageJumpSeq };
+}
+
+function applyPinChange(pin: PinnedMessage, pinned: boolean) {
+  const key = pinsKey(pin.hostId, pin.sessionId);
+  const list = pinnedMessages.peek()[key] ?? [];
+  // Já fixada: o servidor mantém a original (data e trecho), a tela também.
+  if (pinned && list.some((p) => p.anchor === pin.anchor)) return;
+  const rest = list.filter((p) => p.anchor !== pin.anchor);
+  const next = pinned ? [...rest, pin] : rest;
+  const all = { ...pinnedMessages.peek() };
+  if (next.length) all[key] = next;
+  else delete all[key];
+  pinnedMessages.value = all;
+}
+
+async function refreshPins(hostId: string) {
+  if (!pinsSupported.value) return;
+  try {
+    const records = await rpc.call<PinnedMessage[]>('pins.list', { hostId });
+    const next: Record<string, PinnedMessage[]> = {};
+    for (const [key, list] of Object.entries(pinnedMessages.peek())) if (list[0]?.hostId !== hostId) next[key] = list;
+    for (const p of records) (next[pinsKey(p.hostId, p.sessionId)] ??= []).push(p);
+    for (const list of Object.values(next)) list.sort((a, b) => a.pinnedAt - b.pinnedAt);
+    pinnedMessages.value = next;
+  } catch (e) {
+    toast(`Não consegui carregar as mensagens fixadas: ${errorText(e)}`, 'error');
+  }
+}
+
+/** Não anunciar sucesso antes do servidor gravar; uma falha deixa a marca como estava. */
+export async function setMessagePinned(
+  hostId: string,
+  sessionId: string | undefined,
+  pin: { anchor: string; role: 'user' | 'assistant'; snippet: string; at?: number },
+  pinned: boolean,
+): Promise<boolean> {
+  if (!sessionId) return false;
+  if (!pinsSupported.value) {
+    toast('Para fixar mensagens, atualize o servidor do Claude Deck quando ele estiver ocioso.', 'error', 8000);
+    return false;
+  }
+  const key = JSON.stringify([hostId, sessionId, pin.anchor]);
+  const previous = pinOps.get(key);
+  const task = (async () => {
+    if (previous) await previous;
+    try {
+      await rpc.call('pins.set', { hostId, sessionId, ...pin, pinned });
+      // O evento `pins.changed` também chega; aplicar aqui deixa a tela certa mesmo se ele atrasar. É idempotente.
+      applyPinChange({ hostId, sessionId, ...pin, pinnedAt: Date.now() }, pinned);
+      return true;
+    } catch (e) {
+      toast(`Não consegui ${pinned ? 'fixar' : 'desafixar'} a mensagem: ${errorText(e)}`, 'error', 8000);
+      return false;
+    }
+  })();
+  pinOps.set(key, task);
+  void task.finally(() => {
+    if (pinOps.get(key) === task) pinOps.delete(key);
+  });
   return task;
 }
 
@@ -347,6 +438,24 @@ export function removeExtraRoot(hostId: string, root: string) {
 export const quickOpen = signal(false);
 export const commandPalette = signal(false);
 export const addHostDialog = signal(false);
+export const contextModalSid = signal<string | null>(null);
+
+export function openContextModal(sid?: string) {
+  const target = sid ?? activeChatId.value;
+  if (!target) return;
+  contextModalSid.value = target;
+}
+
+export function closeContextModal() {
+  contextModalSid.value = null;
+}
+
+export async function fetchDetailedContext(sid: string): Promise<DetailedContextUsage> {
+  const res = await rpc.call('sessions.control', { sid, request: { subtype: 'get_context_usage' } }, 45_000);
+  const usage = parseDetailedContextUsage(res);
+  if (!usage) throw new Error('O Claude Code não informou dados de contexto nesta conversa.');
+  return usage;
+}
 
 // ------------------------------------------------------------------ persistência do layout
 
@@ -372,6 +481,7 @@ function saveUiState() {
       expanded: expandedDirs.value,
       extraRoots: extraRoots.value,
       collapsedRoots: collapsedRoots.value,
+      explorerDetails: explorerDetails.value,
       terminalVisible: terminalVisible.value,
       terminalHeight: terminalHeight.value,
       terminalWidth: terminalWidth.value,
@@ -394,6 +504,7 @@ effect(() => {
   void expandedDirs.value;
   void extraRoots.value;
   void collapsedRoots.value;
+  void explorerDetails.value;
   void terminalVisible.value;
   void terminalHeight.value;
   void terminalWidth.value;
@@ -516,6 +627,7 @@ async function loadAll(first: boolean) {
     localHome.value = info.home;
     settings.value = info.settings;
     pendingSupported.value = info.manualPending === true;
+    pinsSupported.value = info.pins === true;
     caps.value = info.caps ?? {};
     authPrompts.value = info.prompts ?? [];
   });
@@ -556,6 +668,7 @@ async function loadAll(first: boolean) {
   const sessions = (allSessions as SessionState[]).filter((s) => s.wid === windowId && !closedSids.has(s.sid));
   const pendingHost = att.context?.hostId ?? (sessions[0]?.hostId ?? att.state?.workspace?.hostId ?? 'local');
   await refreshPending(pendingHost);
+  await refreshPins(pendingHost);
   batch(() => {
     hosts.value = hl;
     hostStatus.value = Object.fromEntries((sts as HostStatus[]).map((s) => [s.id, s]));
@@ -578,6 +691,7 @@ async function loadAll(first: boolean) {
       if (st.expanded) expandedDirs.value = st.expanded;
       if (st.extraRoots) extraRoots.value = st.extraRoots;
       if (st.collapsedRoots) collapsedRoots.value = st.collapsedRoots;
+      explorerDetails.value = st.explorerDetails === true;
       if (st.terminalHeight) terminalHeight.value = st.terminalHeight;
       if (st.terminalWidth) terminalWidth.value = Math.max(320, Math.min(st.terminalWidth, window.innerWidth - 500));
       if (st.terminalVisible !== undefined) terminalVisible.value = st.terminalVisible;
@@ -587,8 +701,9 @@ async function loadAll(first: boolean) {
     for (const f of st.fileTabs ?? []) openFile(f.hostId, f.path, { activate: false, mode: f.view as any }).catch(() => {});
     if (st.activeFile) activeFileId.value = files.value.find((f) => f.id === st.activeFile)?.id ?? files.value[0]?.id ?? null;
     editorVisible.value = files.value.length > 0 && st.editorVisible !== false;
-    // Reanexa conversas remotas que continuam vivas nos servidores.
-    rpc.call('sessions.reattach', {}).catch(() => {});
+    // Reanexa as conversas remotas DESTA janela que continuam vivas nos servidores (as de janelas fechadas
+    // ficam soltas, sem segurar a conexão SSH, até a janela delas abrir).
+    rpc.call('sessions.reattach', { sids: tabs.map((t) => t.sid) }).catch(() => {});
     await syncTerminals();
     ready.value = true;
     const activeLoad = activeChat.value ? loadChat(activeChat.value) : Promise.resolve();
@@ -614,10 +729,10 @@ async function loadAll(first: boolean) {
         if (wasLoaded.has(c.sid) || c.sid === activeChatId.value) loadChat(c).catch(() => {});
       } else if (c.loaded) resync(c).catch(() => {});
     }
-    if (bootChanged) rpc.call('sessions.reattach', {}).catch(() => {});
+    if (bootChanged) rpc.call('sessions.reattach', { sids: kept.map((c) => c.sid) }).catch(() => {});
     await syncTerminals();
   }
-  await syncFileCopies(info.fileCopy === 1, bootChanged);
+  await syncFileCopies(info.fileCopy === 1, bootChanged, info.fileCopyDrag === true);
 }
 
 function makeChat(st: SessionState): ChatTab {
@@ -767,6 +882,9 @@ function wireEvents() {
     if (item.pending) next[key] = { hostId: item.hostId, sessionId: item.sessionId, cwd: item.cwd };
     else delete next[key];
     pendingConversations.value = next;
+  });
+  rpc.on('pins.changed', (ev: { pinned: boolean; pin: PinnedMessage }) => {
+    if (ev?.pin) applyPinChange(ev.pin, ev.pinned);
   });
   rpc.on('session.state', (st: SessionState) => {
     const c = chats.value.find((x) => x.sid === st.sid);
@@ -1285,6 +1403,10 @@ export async function sendMessage(c: ChatTab, text: string, images: ImageData[],
     await newChat(st.hostId, st.cwd, { replaceSid: c.sid });
     return;
   }
+  if (!images.length && /^\/context\s*$/i.test(trimmed)) {
+    openContextModal(c.sid);
+    return;
+  }
   const uuid = crypto.randomUUID();
   const content: any[] = images.map((img) => ({ type: 'image', source: { type: 'base64', media_type: img.mediaType, data: img.data } }));
   // No modo Terminal ao Vivo, o painel já fica à vista (o aviso ao Claude é do servidor).
@@ -1334,8 +1456,12 @@ export async function setChatMode(c: ChatTab, mode: PermissionMode) {
 
 export async function setChatModel(c: ChatTab, model: string | null) {
   try {
+    // Conferido com o CLI real: a 2.1.289 (a da extensão do VS Code) aplica a troca já na próxima chamada ao
+    // modelo, dentro da mesma tarefa; a 2.1.205 mantém o modelo do começo da tarefa e só troca na mensagem
+    // seguinte. A versão entre as duas em que isso mudou não foi medida, então o aviso cobre os dois casos.
+    const working = c.model.running || c.model.pendingCount > 0;
     await rpc.call('sessions.setModel', { sid: c.sid, model });
-    toast(`Modelo: ${model || 'padrão do servidor'}`, 'success', 2500);
+    toast(`Modelo: ${model || 'padrão do servidor'}${working ? ' (vale a partir da próxima ação do Claude; em Claude Code antigo, só na próxima mensagem)' : ''}`, 'success', working ? 6000 : 2500);
   } catch (e) {
     toast(errorText(e), 'error');
   }
@@ -1343,8 +1469,9 @@ export async function setChatModel(c: ChatTab, model: string | null) {
 
 export async function setChatEffort(c: ChatTab, effort: EffortLevel | null) {
   try {
+    const working = c.model.running || c.model.pendingCount > 0;
     await rpc.call('sessions.setEffort', { sid: c.sid, effort }, 75_000);
-    toast(`Esforço: ${effort ?? 'padrão do Claude Code'}`, 'success', 3000);
+    toast(`Esforço: ${effort ?? 'padrão do Claude Code'}${working ? ' (vale a partir da próxima ação do Claude)' : ''}`, 'success', working ? 4500 : 3000);
   } catch (e) {
     toast(`Não alterei o esforço: ${errorText(e)}`, 'error', 8000);
   }
@@ -1576,6 +1703,79 @@ export async function connectHost(id: string, force = false) {
   }
 }
 
+/** Servidores cujo Claude Code está sendo atualizado agora (o botão mostra "Atualizando…"). */
+export const updatingClaude = signal<Set<string>>(new Set());
+
+/**
+ * Atualização do Claude Code a oferecer neste servidor, ou null (em dia, desconhecida, computador local ou
+ * binário que o editor atualiza). Quem decide é o servidor do Deck (`HostStatus.claudeLatest`); aqui só confere.
+ */
+export function claudeUpdateOffer(hostId: string): { from: string; to: string } | null {
+  if (hostId === LOCAL_HOST_ID) return null;
+  const st = hostStatus.value[hostId];
+  if (!st?.claude || !isNewerVersion(st.claudeLatest, st.claude.version)) return null;
+  return { from: st.claude.version, to: st.claudeLatest! };
+}
+
+/** Botão "Atualizar Claude Code": confirma, roda `claude update` no servidor e conta o que aconteceu. */
+export async function updateHostClaude(hostId: string) {
+  if (updatingClaude.value.has(hostId)) return;
+  const offer = claudeUpdateOffer(hostId);
+  if (!offer) return;
+  const label = hostLabel(hostId);
+  const ok = await confirmDialog(
+    `Atualizar o Claude Code em ${label}?`,
+    `Versão ${offer.from} → ${offer.to}. O Deck roda "claude update" nesse servidor e pode levar um minuto.\n\nConversas que já estão abertas continuam na versão atual até serem reabertas; as novas já sobem na versão nova.`,
+    'Atualizar',
+  );
+  if (!ok) return;
+  const mark = (on: boolean) => {
+    const next = new Set(updatingClaude.value);
+    if (on) next.add(hostId);
+    else next.delete(hostId);
+    updatingClaude.value = next;
+  };
+  mark(true);
+  try {
+    const r = await rpc.call<ClaudeUpdateResult>('hosts.updateClaude', { id: hostId }, 330_000);
+    if (r.changed) toast(`Claude Code em ${label}: ${r.before} → ${r.after}. Conversas abertas só pegam a versão nova ao serem reabertas.`, 'success', 9000);
+    else
+      toast(
+        `Claude Code em ${label} já está na versão mais nova disponível para ele (${r.after})${r.latest && r.latest !== r.after ? `; a ${r.latest} ainda não chegou ao canal desse servidor` : ''}.`,
+        'info',
+        9000,
+      );
+  } catch (e) {
+    toast(`Não atualizei o Claude Code em ${label}: ${errorText(e)}`, 'error', 14000);
+  } finally {
+    mark(false);
+  }
+}
+
+/**
+ * Desconectar de um servidor. As conversas dele soltam o canal e ficam pausadas (o Claude de lá segue rodando);
+ * voltam quando você manda uma mensagem. Se alguma está trabalhando agora, pergunta antes: o que ela escreve
+ * enquanto estiver desconectada só aparece quando reconectar.
+ */
+export async function disconnectHost(id: string) {
+  try {
+    // Servidor antigo não tem esta pergunta: segue sem avisar.
+    const running = await rpc.call<number>('hosts.runningCount', { id }).catch(() => 0);
+    if (running > 0) {
+      const ok = await confirmDialog(
+        `Desconectar de ${id}?`,
+        `${running === 1 ? '1 conversa está trabalhando' : `${running} conversas estão trabalhando`} neste servidor. Ela continua lá, mas o que for escrito só aparece quando você reconectar (mandando uma mensagem ou reabrindo a janela).`,
+        'Desconectar',
+        true,
+      );
+      if (!ok) return;
+    }
+    await rpc.call('hosts.disconnect', { id });
+  } catch (e) {
+    toast(`Não consegui desconectar de ${id}: ${errorText(e)}`, 'error');
+  }
+}
+
 export async function toggleFavorite(id: string) {
   const h = hostInfo(id);
   if (!h) return;
@@ -1734,6 +1934,23 @@ export async function openTerminal(hostId?: string, cwd?: string) {
   }
 }
 
+let ensureTerminalInFlight: Promise<TerminalTabInfo | null> | null = null;
+
+/**
+ * Garante ao menos um terminal sem duplicar: quem pede "mostre o terminal" (atalho, barra de status
+ * e o próprio painel ao montar) pode chegar junto antes de a primeira abertura responder; todos
+ * compartilham a mesma chamada `term.open`.
+ */
+export function ensureTerminal(): Promise<TerminalTabInfo | null> {
+  if (terminalTabs.value.length > 0) return Promise.resolve(null);
+  if (!ensureTerminalInFlight) {
+    ensureTerminalInFlight = openTerminal()
+      .catch(() => null)
+      .finally(() => { ensureTerminalInFlight = null; });
+  }
+  return ensureTerminalInFlight;
+}
+
 export async function closeTerminal(id: string) {
   try {
     await rpc.call('term.close', { id });
@@ -1750,9 +1967,7 @@ export async function closeTerminal(id: string) {
 
 export function toggleTerminal() {
   terminalVisible.value = !terminalVisible.value;
-  if (terminalVisible.value && terminalTabs.value.length === 0) {
-    openTerminal().catch(() => {});
-  }
+  if (terminalVisible.value) void ensureTerminal();
 }
 
 // ------------------------------------------------------------------ configurações e tema

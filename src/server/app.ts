@@ -10,7 +10,7 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { AppPaths } from './config';
-import { Store, loadOrCreateToken, writeJsonAtomic } from './config';
+import { PIN_ANCHOR, Store, loadOrCreateToken, writeJsonAtomic } from './config';
 import { PromptBroker } from './prompts';
 import { HostRegistry } from './hosts/registry';
 import { SessionManager, type ClaudeSession, type TerminalBinder } from './claude/session';
@@ -26,9 +26,10 @@ import { receivesSessionMsg } from './routing';
 import { WID_RE, attachWindow, contextKey, getWindowContext, migrateLegacyWindows, pruneWindows, reconcileWindowSessions, sameContext, saveWindowState } from './windows';
 import { buildOpenUrl, launchWindow, focusWindow, BROWSER_IDS, findBrowser, resolveBrowser, type BrowserSelection } from './browser';
 import { TaskbarBadge, summarizeBadge } from './taskbar';
+import { readClipboardText } from './clipboard';
 import { OPEN_RE, isValidTarget, type OpenTarget } from '../shared/openwin';
 import { DeckError, type RpcRequest } from '../shared/protocol';
-import { LOCAL_HOST_ID, type BrowserId, type FileEntry, type ManualPendingConversation, type ReadResult, type SearchResult, type UiState } from '../shared/types';
+import { LOCAL_HOST_ID, MAX_PINS_PER_CONVERSATION, PIN_SNIPPET_MAX, type BrowserId, type FileEntry, type ManualPendingConversation, type ReadResult, type SearchResult, type UiState } from '../shared/types';
 import { isAbsolute, relativeTo } from '../shared/paths';
 import { contentTypeFor } from './mime';
 import { TerminalManager } from './terminal/manager';
@@ -38,7 +39,7 @@ import { isFocusReport, isTerminalReport } from '../shared/terminalProtocol';
 export const APP_VERSION = '1.0.0';
 const BOOT_ID = crypto.randomUUID();
 /** Métodos que uma versão anterior do servidor não tinha (ver `on`, modo de teste). */
-const OLD_SERVER_MISSING = new Set(['fs.mkdirp', 'fs.existsMany', 'dl.ticket', 'history.agent', 'sessions.stopTask', 'fileClipboard.set', 'fileClipboard.get', 'fileClipboard.clear', 'fileCopy.start', 'fileCopy.list', 'fileCopy.get', 'fileCopy.resolve', 'fileCopy.cancel', 'fileCopy.edits', 'fileCopy.ack']);
+const OLD_SERVER_MISSING = new Set(['fs.mkdirp', 'fs.existsMany', 'dl.ticket', 'history.agent', 'sessions.stopTask', 'fileClipboard.set', 'fileClipboard.get', 'fileClipboard.clear', 'fileCopy.start', 'fileCopy.list', 'fileCopy.get', 'fileCopy.resolve', 'fileCopy.cancel', 'fileCopy.edits', 'fileCopy.ack', 'clipboard.readText', 'pins.list', 'pins.set', 'hosts.updateClaude']);
 
 export interface ServerOptions {
   port: number;
@@ -90,6 +91,8 @@ export class DeckServer {
   /** Desde quando cada janela está conectada sem interrupção (para saber quem "ficou aberta"). */
   private liveSince = new Map<string, number>();
   private stopping = false;
+  /** Leitura da área de transferência em andamento (ver `clipboard.readText`). */
+  private clipboardRead: Promise<string> | null = null;
   /** Só nos testes: janelas que o servidor teria aberto no navegador selecionado. */
   private testLaunches: string[] = [];
   /** Data (ms) do arquivo do servidor que está rodando: o atalho compara com o do disco. */
@@ -702,7 +705,12 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
         if (!live.has(wid)) {
           this.log(`janela: ${this.winLabel(wid)} fechada (abertas agora: ${live.size})`);
           this.liveSince.delete(wid);
+          const termHosts = this.terminalManager.list(wid).map((t) => t.hostId);
           this.terminalManager.closeForWindow(wid);
+          // Conversas paradas desta janela soltam o canal: sem isso elas seguravam a conexão SSH do servidor
+          // para sempre, mesmo sem ninguém olhando. As que ainda trabalham seguem ligadas (avisam ao terminar).
+          const parkedHosts = this.sessions.parkIdleOfWindow(wid);
+          for (const h of new Set([...termHosts, ...parkedHosts])) this.releaseHostSoon(h);
           // Fechou só esta janela (as outras ficaram abertas) = não reabre sozinha no próximo início.
           // Se todas saíram juntas (fechou o Brave, desligou o PC) ou era a última, continua marcada.
           // Uma janela que também fechou e já foi REABERTA (atalho logo depois de fechar tudo) não conta
@@ -893,6 +901,25 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
     return host;
   }
 
+  /** Ainda há conversa, terminal ou cópia dependendo da conexão SSH deste servidor? */
+  private hostInUse(hostId: string): boolean {
+    for (const s of this.sessions.sessions.values()) {
+      if (s.state.hostId !== hostId || s.isClosing) continue;
+      // Conversa parada (dormant/erro) não segura a conexão: reconecta quando for usada de novo.
+      if (s.alive || ['starting', 'running', 'reconnecting'].includes(s.state.phase)) return true;
+    }
+    if (this.terminalManager.list().some((t) => t.hostId === hostId)) return true;
+    // Cópias não dizem de qual servidor são aqui: qualquer uma em andamento adia a liberação.
+    return this.transfers.busy > 0;
+  }
+
+  /** Uma aba do servidor foi fechada pelo botão: solta a conexão SSH se ela ficou sem uso. */
+  private releaseHostSoon(hostId: string | undefined) {
+    if (!hostId || hostId === LOCAL_HOST_ID || this.stopping) return;
+    const grace = Number(process.env.CLAUDE_DECK_TEST_HOOKS === '1' && process.env.CLAUDE_DECK_RELEASE_GRACE_MS) || undefined;
+    this.registry.releaseWhenIdle(hostId, () => this.hostInUse(hostId), grace);
+  }
+
   private copyWindow(client: Client, hostId?: unknown): string {
     const rec = client.wid ? this.store.windows[client.wid] : undefined;
     if (!client.wid || !rec) throw new DeckError('otherwindow', 'A janela precisa estar anexada antes de copiar/colar.');
@@ -927,6 +954,15 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
     if (typeof p.cwd !== 'string' || !p.cwd || p.cwd.length > 32_768 || /[\x00-\x1f\x7f]/.test(p.cwd) || !isAbsolute(host.platform, p.cwd))
       throw new DeckError('bad', 'Pasta da conversa inválida.');
     return { hostId, sessionId: p.sessionId, cwd: p.cwd };
+  }
+
+  /** Servidor + sessão (sem pasta: a mensagem fixada não precisa localizar o transcript). */
+  private conversationRef(params: unknown): { hostId: string; sessionId: string } {
+    const p = params as { hostId?: unknown; sessionId?: unknown } | null;
+    const hostId = this.pendingHostId(p?.hostId);
+    if (typeof p?.sessionId !== 'string' || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(p.sessionId))
+      throw new DeckError('bad', 'Id da conversa inválido.');
+    return { hostId, sessionId: p.sessionId };
   }
 
   /** Liga/desliga o início automático do servidor com o Windows (atalho na pasta Inicializar). */
@@ -991,10 +1027,14 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
       version: APP_VERSION,
       windowRestore: true,
       fileCopy: this.handlers.has('fileCopy.start') ? 1 : 0,
+      // `fileCopy.start` aceita `source` (item arrastado de uma janela de outro servidor).
+      fileCopyDrag: this.handlers.has('fileCopy.start'),
       // Enviar pasta inteira, baixar pasta em .zip e arrastar para fora dependem destes métodos.
       folderTransfer: this.handlers.has('dl.ticket'),
       // Conversas marcadas pelo usuário para voltar depois (independente de turnos automáticos não vistos).
       manualPending: true,
+      // Mensagens fixadas (marcador de leitura): `pins.list` / `pins.set`. Interface nova com servidor antigo avisa.
+      pins: this.handlers.has('pins.set'),
       browserSelection: true,
       browser: (() => { try { return resolveBrowser(this.opts.paths.dataDir).id; } catch { return null; } })(),
       bootId: BOOT_ID,
@@ -1181,9 +1221,15 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
     this.on('hosts.statuses', () => this.registry.allStatuses());
     this.on('hosts.connect', ({ id, force }) => this.registry.connect(id, !!force));
     this.on('hosts.disconnect', ({ id }) => {
+      // Antes de fechar: as conversas soltam o canal e ficam pausadas. Sem isso cada uma tratava o fim do canal
+      // como queda de rede e reconectava em 0,5 s, desfazendo o "Desconectar". O Claude do servidor segue rodando;
+      // a conversa volta quando você manda uma mensagem ou abre a janela dela.
+      const parked = this.sessions.parkHost(id);
+      if (parked) this.log(`[${id}] desconectar: ${parked} conversa(s) soltas (o Claude delas segue no servidor)`);
       this.registry.disconnect(id);
       return true;
     });
+    this.on('hosts.runningCount', ({ id }) => [...this.sessions.sessions.values()].filter((s) => s.state.hostId === id && s.state.phase === 'running').length);
     this.on('hosts.favorite', ({ id, favorite }) => {
       const f = this.store.hosts.favorites.filter((x) => x !== id);
       if (favorite) f.push(id);
@@ -1222,6 +1268,8 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
     });
     // Teste sem interação e só de leitura (não pede senha, não grava nada): "Testar todos".
     this.on('hosts.check', ({ id }) => this.registry.check(id));
+    // Atualiza o Claude Code do servidor (`claude update` lá). Só roda quando o usuário clica e confirma.
+    this.on('hosts.updateClaude', ({ id }) => this.registry.updateClaude(String(id)));
     // Só nos testes automáticos (variável de ambiente): simula a queda da rede com um servidor.
     if (process.env.CLAUDE_DECK_TEST_HOOKS === '1') {
       this.on('test.dropHost', ({ id }) => {
@@ -1235,7 +1283,13 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
     this.on('fileClipboard.get', (_p, c) => { this.copyWindow(c); return this.transfers.clipboard; });
     this.on('fileClipboard.set', ({ hostId, path }, c) => this.transfers.setClipboard(this.copyWindow(c, hostId), hostId, path));
     this.on('fileClipboard.clear', (_p, c) => { this.copyWindow(c); this.transfers.clearClipboard(); return true; });
-    this.on('fileCopy.start', (p, c) => this.transfers.start(this.copyWindow(c, p.hostId), p));
+    this.on('fileCopy.start', (p, c) => {
+      const wid = this.copyWindow(c, p.hostId);
+      // Arrasto de outra janela: a origem vem no pedido (o destino continua sendo o servidor desta janela).
+      if (p.source !== undefined && (typeof p.source?.hostId !== 'string' || !this.registry.exists(p.source.hostId)))
+        throw new DeckError('nohost', 'Servidor de origem desconhecido.');
+      return this.transfers.start(wid, p);
+    });
     this.on('fileCopy.list', (_p, c) => this.transfers.list(this.copyWindow(c)));
     this.on('fileCopy.get', ({ id, requestId, offset }, c) => {
       const wid = this.copyWindow(c);
@@ -1425,8 +1479,14 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
       await this.sessions.get(sid).start();
       return true;
     });
-    this.on('sessions.reattach', ({ sids }) => {
-      this.sessions.resumeRemote(sids);
+    this.on('sessions.reattach', ({ sids }, client) => {
+      // Interface antiga (janela ainda não recarregada) não manda `sids` e antes reanexava TODAS as conversas
+      // de TODOS os servidores a cada janela aberta, religando as conexões SSH que acabaram de ser soltas.
+      // Sem `sids`, vale o mesmo critério: só as conversas desta janela (e as sem dono).
+      const own = Array.isArray(sids)
+        ? sids.filter((x): x is string => typeof x === 'string')
+        : [...this.sessions.sessions.values()].filter((s) => !s.state.wid || s.state.wid === client.wid).map((s) => s.state.sid);
+      this.sessions.resumeRemote(own);
       return true;
     });
     this.on('sessions.send', async ({ sid, content, uuid }, client) => {
@@ -1486,6 +1546,7 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
       return true;
     });
     this.on('sessions.close', async ({ sid }) => {
+      const hostId = this.sessions.sessions.get(sid)?.state.hostId;
       await this.sessions.close(sid);
       // A aba fechada sai também do estado salvo da janela (a interface pode ter gravado antes).
       let changed = false;
@@ -1495,6 +1556,7 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
         if (w.state.chatTabs.length !== n) changed = true;
       }
       if (changed) this.store.saveWindows();
+      this.releaseHostSoon(hostId);
       return true;
     });
     this.on('sessions.caps', ({ hostId }) => this.sessions.caps.get(hostId) ?? null);
@@ -1510,6 +1572,22 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
         // Pendência sem aba aberta continua só no Histórico; o resumo já filtra as janelas vivas.
         this.taskbarBadge.touch();
       }
+      return true;
+    });
+
+    // --- mensagens fixadas (só marcadores de leitura: nada disto toca o transcript nem o contexto do Claude)
+    this.on('pins.list', ({ hostId }) => this.store.listPins(this.pendingHostId(hostId)));
+    this.on('pins.set', (params) => {
+      const ref = this.conversationRef(params);
+      if (typeof params?.pinned !== 'boolean') throw new DeckError('bad', 'Estado de fixação inválido.');
+      if (typeof params.anchor !== 'string' || !PIN_ANCHOR.test(params.anchor)) throw new DeckError('bad', 'Mensagem inválida.');
+      if (params.role !== 'user' && params.role !== 'assistant') throw new DeckError('bad', 'Autor da mensagem inválido.');
+      const snippet = typeof params.snippet === 'string' ? params.snippet.replace(/\s+/g, ' ').trim().slice(0, PIN_SNIPPET_MAX) : '';
+      const at = typeof params.at === 'number' && Number.isFinite(params.at) ? params.at : undefined;
+      const result = this.store.setPin({ ...ref, anchor: params.anchor, role: params.role, snippet, at }, params.pinned);
+      if (result.full) throw new DeckError('limit', `Esta conversa já tem ${MAX_PINS_PER_CONVERSATION} mensagens fixadas. Desafixe alguma antes.`);
+      // Idempotente: repetições não regravam nem inundam as outras janelas com o mesmo evento.
+      if (result.changed && result.record) this.broadcast('pins.changed', { pinned: params.pinned, pin: result.record });
       return true;
     });
 
@@ -1541,6 +1619,8 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
       if (s.state.wid && s.state.wid !== client.wid) throw new DeckError('otherwindow', 'Esta conversa pertence a outra janela.');
       if (!s.state.sessionId || !/^[0-9a-f-]{36}$/i.test(s.state.sessionId) || typeof agentId !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(agentId))
         throw new DeckError('bad', 'Conversa ou agente inválido.');
+      // A interface consulta isto a cada poucos segundos enquanto há agentes rodando: sem conexão, não abre uma.
+      if (s.isRemote && this.registry.status(s.state.hostId).state !== 'ready') throw new DeckError('disconnected', 'Servidor desconectado.');
       const host = await this.fsFor(s.state.hostId);
       const file = await this.history.findFile(host, await this.homeOf(s.state.hostId), s.state.sessionId, s.state.cwd);
       if (!file) throw new DeckError('notfound', 'Transcript da conversa não encontrado.');
@@ -1585,7 +1665,18 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
       if (!Number.isInteger(p.cols) || !Number.isInteger(p.rows) || p.cols < 2 || p.rows < 1 || p.cols > 1000 || p.rows > 500) throw new DeckError('bad', 'Dimensões inválidas.');
       return this.terminalManager.resize(p.id, p.cols, p.rows);
     });
-    this.on('term.close', (p, client) => { this.ownedTerminal(p.id, client); return this.terminalManager.close(p.id); });
+    // Reserva da colagem (botão direito) quando o navegador nega `clipboard.readText`: só serve a quem tem o
+    // terminal em que o texto vai cair, e nunca roda dois PowerShell ao mesmo tempo.
+    this.on('clipboard.readText', (p, client) => {
+      this.ownedTerminal(p?.id, client);
+      return (this.clipboardRead ??= readClipboardText().finally(() => { this.clipboardRead = null; }));
+    });
+    this.on('term.close', (p, client) => {
+      const t = this.ownedTerminal(p.id, client);
+      const closed = this.terminalManager.close(p.id);
+      this.releaseHostSoon(t.hostId);
+      return closed;
+    });
     this.on('term.list', (_p, client) => this.terminalManager.list().filter((t) => t.wid === client.wid));
     this.on('term.replay', ({ id, since }, client) => {
       this.ownedTerminal(id, client);

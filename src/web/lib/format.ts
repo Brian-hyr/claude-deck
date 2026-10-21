@@ -25,6 +25,20 @@ export function formatDateTime(ms: number): string {
   return dateTimeFmt.format(new Date(ms));
 }
 
+const dayMonthFmt = new Intl.DateTimeFormat('pt-BR', { day: '2-digit', month: '2-digit' });
+const hourMinuteFmt = new Intl.DateTimeFormat('pt-BR', { hour: '2-digit', minute: '2-digit' });
+const dayMonthYearFmt = new Intl.DateTimeFormat('pt-BR', { day: '2-digit', month: '2-digit', year: '2-digit' });
+
+/**
+ * Data curta para colunas (largura quase fixa): "15/10 14:32" no ano corrente, "15/10/25" nos outros.
+ * Sem o ano, "15/10" de dois anos atrás pareceria recente; sem a hora, a de arquivos antigos só ocuparia espaço.
+ */
+export function formatDateCompact(ms: number, now = Date.now()): string {
+  const d = new Date(ms);
+  if (d.getFullYear() !== new Date(now).getFullYear()) return dayMonthYearFmt.format(d);
+  return `${dayMonthFmt.format(d)} ${hourMinuteFmt.format(d)}`;
+}
+
 // Mesma razão: o chat refaz a lista inteira de mensagens a cada pedaço de resposta que chega, e cada mensagem
 // formatava data/números com `toLocale*String` (um formatador novo por chamada). Com 100 mensagens isso deixava
 // a thread principal 77% ocupada durante o streaming (250 mensagens: 99,7%, quadros de 170 ms).

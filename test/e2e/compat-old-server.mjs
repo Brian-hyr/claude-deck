@@ -4,10 +4,12 @@
 // o que depende do servidor novo (.zip, arrastar para fora) tem que avisar em vez de baixar uma página HTML.
 //
 //   node test/e2e/compat-old-server.mjs
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { startEnv, helpers, sleep, SANDBOX } from './harness.mjs';
+import { dropDeckItem } from './file-copy-checks.mjs';
 
 const env = await startEnv({ env: { CLAUDE_DECK_TEST_HOOKS: '1', CLAUDE_DECK_TEST_OLD_SERVER: '1' }, sandboxSrc: SANDBOX });
 const { page, sandbox } = env;
@@ -127,6 +129,23 @@ try {
     assert(!items.some((i) => i.type.toLowerCase() === 'downloadurl'), 'sem bilhete no servidor anterior: o arrasto não deveria trazer DownloadURL');
     await cdp.detach().catch(() => {});
     fs.rmSync(dlDir, { recursive: true, force: true });
+  });
+
+  await step('arrastar da janela de outro servidor avisa que precisa do servidor novo (e não copia)', async () => {
+    await dropDeckItem({ page, h }, { hostId: 'outro-servidor', path: '/tmp/x.txt', dir: false });
+    await waitText('.toast', 'Arrastar entre servidores exige a versão nova');
+    assert(!(await page.$('.dialog')), 'não deveria abrir confirmação sem suporte no servidor');
+  });
+
+  await step('fixar mensagem avisa que precisa do servidor novo e não finge que fixou', async () => {
+    assert((await h.rpc('app.info')).pins === false, 'servidor antigo anunciou mensagens fixadas');
+    const err = await h.rpc('pins.set', { hostId: 'local', sessionId: crypto.randomUUID(), anchor: 'x', role: 'user', snippet: '', pinned: true }).then(() => null, (e) => e.message);
+    assert(err && /desconhecido/i.test(err), `pins.set deveria não existir: ${err}`);
+    await page.waitForSelector('.msg-pin:not([disabled])', { timeout: 8000 });
+    await page.click('.msg-pin');
+    await waitText('.toast', 'atualize o servidor');
+    assert(!(await page.$('.msg-pin.pinned')), 'marcou como fixada sem o servidor gravar');
+    assert(!(await page.$('.chat-header .pins-toggle.has-pins')), 'o cabeçalho não deveria contar fixadas');
   });
 } finally {
   fs.rmSync(src, { recursive: true, force: true });

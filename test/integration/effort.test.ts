@@ -68,16 +68,62 @@ describe('esforço por conversa', () => {
     await env.client.call('sessions.close', { sid: two.sid });
   }, 90_000);
 
-  it('rejeita nível inválido e não reinicia um turno em andamento', async () => {
+  it('rejeita nível inválido', async () => {
     const s = await env.client.call('sessions.create', { hostId: 'local', cwd });
     await env.client.waitFor((e) => e.event === 'session.state' && e.data.sid === s.sid && e.data.phase === 'idle');
     await expect(env.client.call('sessions.setEffort', { sid: s.sid, effort: 'ultra-unsafe' })).rejects.toMatchObject({ code: 'bad' });
+    expect((await env.client.call('sessions.list')).find((x: any) => x.sid === s.sid).effort).toBeUndefined();
+    await env.client.call('sessions.close', { sid: s.sid });
+  }, 30_000);
+
+  it('troca o esforço no meio de uma tarefa: vale na próxima ação, sem reiniciar nem interromper', async () => {
+    const s = await env.client.call('sessions.create', { hostId: 'local', cwd });
+    await env.client.waitFor((e) => e.event === 'session.state' && e.data.sid === s.sid && e.data.phase === 'idle');
+    await turn(env.client, s.sid, 'echo oi'); // o sessionId só existe depois da primeira conversa
+    const sessionId = (await env.client.call('sessions.list')).find((x: any) => x.sid === s.sid).sessionId;
+    expect(sessionId).toBeTruthy();
     const offset = env.client.events.length;
-    await env.client.call('sessions.send', { sid: s.sid, content: [{ type: 'text', text: 'slow 20' }], uuid: crypto.randomUUID() });
+    await env.client.call('sessions.send', { sid: s.sid, content: [{ type: 'text', text: 'slowfx 30' }], uuid: crypto.randomUUID() });
     await env.client.waitFor((e) => e.event === 'session.state' && e.data.sid === s.sid && e.data.phase === 'running' && env.client.events.indexOf(e) >= offset);
-    await expect(env.client.call('sessions.setEffort', { sid: s.sid, effort: 'low' })).rejects.toMatchObject({ code: 'busy' });
-    await env.client.waitFor((e) => e.event === 'session.msg' && e.data.sid === s.sid && e.data.msg.type === 'result' && env.client.events.indexOf(e) >= offset);
+    await env.client.call('sessions.setEffort', { sid: s.sid, effort: 'low' });
+    const during = (await env.client.call('sessions.list')).find((x: any) => x.sid === s.sid);
+    expect(during).toMatchObject({ effort: 'low', phase: 'running', sessionId });
+    const result = await env.client.waitFor((e) => e.event === 'session.msg' && e.data.sid === s.sid && e.data.msg.type === 'result' && env.client.events.indexOf(e) >= offset, 20_000, 'fim da tarefa');
+    expect(result.data.msg.is_error).toBeFalsy();
+    const text = env.client.events.slice(offset).filter((e) => e.event === 'session.msg' && e.data.sid === s.sid && e.data.msg.type === 'assistant').map((e) => JSON.stringify(e.data.msg)).join('\n');
+    expect(text).toContain('esforço-na-próxima-ação=low');
+    // Voltar ao padrão também vale no meio da tarefa, e o processo segue o mesmo.
+    const second = env.client.events.length;
+    await env.client.call('sessions.send', { sid: s.sid, content: [{ type: 'text', text: 'slowfx 30' }], uuid: crypto.randomUUID() });
+    await env.client.waitFor((e) => e.event === 'session.state' && e.data.sid === s.sid && e.data.phase === 'running' && env.client.events.indexOf(e) >= second);
+    await env.client.call('sessions.setEffort', { sid: s.sid, effort: null });
+    await env.client.waitFor((e) => e.event === 'session.msg' && e.data.sid === s.sid && e.data.msg.type === 'result' && env.client.events.indexOf(e) >= second, 20_000, 'fim da segunda tarefa');
+    expect(JSON.stringify(env.client.events.slice(second).filter((e) => e.event === 'session.msg').map((e) => e.data.msg))).toContain('esforço-na-próxima-ação=default');
+    expect((await env.client.call('sessions.list')).find((x: any) => x.sid === s.sid)).toMatchObject({ sessionId });
     expect((await env.client.call('sessions.list')).find((x: any) => x.sid === s.sid).effort).toBeUndefined();
     await env.client.call('sessions.close', { sid: s.sid });
   }, 60_000);
+
+  describe('Claude Code antigo, sem apply_flag_settings', () => {
+    beforeAll(() => { process.env.FAKE_NO_FLAG_SETTINGS = '1'; });
+    afterAll(() => { delete process.env.FAKE_NO_FLAG_SETTINGS; });
+
+    it('entre tarefas reinicia com --effort (como antes); no meio da tarefa explica e não reinicia', async () => {
+      const s = await env.client.call('sessions.create', { hostId: 'local', cwd });
+      await env.client.waitFor((e) => e.event === 'session.state' && e.data.sid === s.sid && e.data.phase === 'idle');
+      await turn(env.client, s.sid, 'echo oi'); // o sessionId só existe depois da primeira conversa
+      const sessionId = (await env.client.call('sessions.list')).find((x: any) => x.sid === s.sid).sessionId;
+      expect(sessionId).toBeTruthy();
+      await env.client.call('sessions.setEffort', { sid: s.sid, effort: 'high' });
+      const changed = await turn(env.client, s.sid, 'effort');
+      expect(changed.some((m) => m.type === 'assistant' && m.message?.content?.some((b: any) => b.text?.includes(`esforço=high sessão=${sessionId}`)))).toBe(true);
+      const offset = env.client.events.length;
+      await env.client.call('sessions.send', { sid: s.sid, content: [{ type: 'text', text: 'slow 20' }], uuid: crypto.randomUUID() });
+      await env.client.waitFor((e) => e.event === 'session.state' && e.data.sid === s.sid && e.data.phase === 'running' && env.client.events.indexOf(e) >= offset);
+      await expect(env.client.call('sessions.setEffort', { sid: s.sid, effort: 'low' })).rejects.toMatchObject({ code: 'busy', message: expect.stringMatching(/antigo/) });
+      await env.client.waitFor((e) => e.event === 'session.msg' && e.data.sid === s.sid && e.data.msg.type === 'result' && env.client.events.indexOf(e) >= offset);
+      expect((await env.client.call('sessions.list')).find((x: any) => x.sid === s.sid).effort).toBe('high');
+      await env.client.call('sessions.close', { sid: s.sid });
+    }, 60_000);
+  });
 });
