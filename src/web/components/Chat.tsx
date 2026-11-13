@@ -5,23 +5,34 @@ import { rpc } from '../lib/rpc';
 import {
   chats,
   errorText,
+  firstMessageJump,
   folderBrowser,
   homeOf,
   hostColor,
   hostLabel,
+  hostStatus,
   hosts,
+  installHostAgy,
+  installingAgy,
   isPending,
+  isChatPinned,
+  toggleChatPinned,
   isPinned,
+  jumpToFirstMessage,
   messageJump,
   pinsFor,
+  setChatEngine,
   setConversationPending,
   setMessagePinned,
   loadChat,
   loadEarlier,
   newChat,
   newChatPicker,
+  openNewOrchestrator,
   openContextModal,
+  orqSupported,
   renamingSid,
+  resendMessage,
   sidebarView,
   sidebarVisible,
   toast,
@@ -34,6 +45,7 @@ import { ToolCard } from './ToolCard';
 import { Composer } from './Composer';
 import { openMenu } from './ContextMenu';
 import { togglePinsMenu } from './PinsMenu';
+import { OrqBanner } from './Orchestrator';
 import { formatCost, formatDuration, formatElapsed, formatFullDateTime, formatInt, formatTokens } from '../lib/format';
 import { openChatPath } from '../lib/chatPaths';
 import { tildify } from '../../shared/paths';
@@ -117,6 +129,23 @@ function snippetOf(text: string, hasImages = false): string {
  * Alfinete da mensagem: fixa/desafixa para voltar a ela depois pela lista do cabeçalho. É só um marcador de
  * leitura — não escreve na caixa de mensagem nem manda nada ao Claude.
  */
+/**
+ * Mensagem enviada com o Claude trabalhando, depois que a tarefa acabou: o modelo às vezes a ignora. Um clique a reenvia
+ * como mensagem nova. Ainda sem o eco do CLI (`pending`), o botão só aparece depois de alguns segundos (no CSS), para não
+ * piscar quando o CLI abre sozinho o turno dessa mensagem logo após a tarefa.
+ */
+function ResendMsgButton({ c, item }: { c: ChatTab; item: UserItem }) {
+  const unconfirmed = !!item.pending;
+  const title = unconfirmed
+    ? 'O Claude não confirmou o recebimento desta mensagem. Reenvie como mensagem nova (se a original ainda chegar, ele a verá duas vezes).'
+    : 'Você enviou esta mensagem com o Claude trabalhando. Se ele não respondeu a ela, reenvie como mensagem nova.';
+  return (
+    <button class={`msg-resend${unconfirmed ? ' unconfirmed' : ''}`} type="button" title={title} onClick={(e) => { e.stopPropagation(); void resendMessage(c, item); }}>
+      <Icon name="debug-restart" style={{ fontSize: 12 }} /> Reenviar como nova mensagem
+    </button>
+  );
+}
+
 function PinMsgButton({ c, anchor, role, text, at, hasImages }: { c: ChatTab; anchor: string; role: 'user' | 'assistant'; text: string; at?: number; hasImages?: boolean }) {
   const st = c.state.value;
   const pinned = isPinned(st.hostId, st.sessionId, anchor);
@@ -236,14 +265,25 @@ function senderOf(m: { from?: string; name?: string }): string | undefined {
 function InjectedAgentMessageItem({ item, onOpenPath }: { item: UserItem; onOpenPath: (p: string) => void }) {
   const [open, setOpen] = useState(false);
   const msgs = item.agentMessages?.length ? item.agentMessages : [{ body: item.text }];
-  const who = [...new Set(msgs.map(senderOf).filter(Boolean))];
-  const session = msgs.every((m) => m.kind === 'session');
+  const kind = msgs.every((m) => m.kind === msgs[0].kind) ? (msgs[0].kind ?? 'agent') : 'agent';
+  const who = kind === 'orchestrator' || kind === 'deck' ? [] : [...new Set(msgs.map(senderOf).filter(Boolean))];
+  const label =
+    kind === 'session' ? 'Mensagem de outra sessão' : kind === 'orchestrator' ? 'Mensagem do orquestrador' : kind === 'deck' ? 'Atualização da orquestração' : 'Mensagem de outro agente';
+  const icon = kind === 'session' ? 'comment-discussion' : kind === 'orchestrator' ? 'organization' : kind === 'deck' ? 'pulse' : 'hubot';
+  const hint =
+    kind === 'session'
+      ? 'Enviada por outra sessão do Claude'
+      : kind === 'orchestrator'
+        ? 'Enviada pelo orquestrador desta tarefa (outra conversa do Claude, no Claude Deck)'
+        : kind === 'deck'
+          ? 'Enviada pelo Claude Deck: eventos dos workers, aprovação do plano e lembretes'
+          : 'Enviada por outro agente (subagente ou colega de equipe)';
   return (
-    <div class="injected-card agent">
+    <div class={`injected-card agent${kind === 'orchestrator' || kind === 'deck' ? ' orq' : ''}`}>
       <div class="injected-head" onClick={() => setOpen(!open)} title={open ? 'Recolher' : 'Ler a mensagem'}>
-        <Icon name={session ? 'comment-discussion' : 'hubot'} style={{ color: '#a371f7' }} />
+        <Icon name={icon} style={{ color: '#a371f7' }} />
         <span class="injected-title agent-title">
-          {session ? 'Mensagem de outra sessão' : 'Mensagem de outro agente'}
+          {label}
           {who.length ? <strong> · {who.join(', ')}</strong> : null}
           {!open && <span class="injected-preview"> — {previewOf(msgs[0].body)}</span>}
         </span>
@@ -252,9 +292,7 @@ function InjectedAgentMessageItem({ item, onOpenPath }: { item: UserItem; onOpen
       </div>
       {open && (
         <div class="injected-body">
-          <div class="injected-hint">
-            {session ? 'Enviada por outra sessão do Claude' : 'Enviada por outro agente (subagente ou colega de equipe)'} — não foi você quem escreveu.
-          </div>
+          <div class="injected-hint">{hint} — não foi você quem escreveu.</div>
           {msgs.map((m, i) => (
             <div key={i} class={i > 0 ? 'agent-msg-next' : undefined}>
               {msgs.length > 1 && senderOf(m) && <div class="injected-hint">de {senderOf(m)}</div>}
@@ -608,6 +646,48 @@ export function Chat({ c }: { c: ChatTab }) {
     };
   }, [jump?.n, c.sid]);
 
+  // Pulo até a primeira mensagem (solicitação inicial da conversa).
+  // Se há trechos anteriores não carregados (c.hasMore), busca as páginas anteriores até o início.
+  const firstJump = firstMessageJump.value;
+  useEffect(() => {
+    if (!firstJump || firstJump.sid !== c.sid) return;
+    let cancelled = false;
+    const findFirst = () => {
+      const root = scroller.current;
+      if (!root) return null;
+      // Prioriza a primeira mensagem do usuário (a solicitação inicial real do chat).
+      return root.querySelector<HTMLElement>('.msg.user') ?? root.querySelector<HTMLElement>('.msg') ?? null;
+    };
+    void (async () => {
+      try {
+        stick.current = false;
+        if (c.hasMore.value) {
+          toast('Carregando o início da conversa…');
+          for (let page = 0; !cancelled && c.hasMore.value && page < MAX_JUMP_PAGES; page++) {
+            await loadEarlier(c);
+            await new Promise((r) => setTimeout(r, 60));
+          }
+        }
+        if (cancelled) return;
+        stick.current = false;
+        const target = findFirst();
+        if (scroller.current) {
+          scroller.current.scrollTo({ top: 0, behavior: 'smooth' });
+        }
+        if (target) {
+          flashMessage(target);
+        }
+      } catch (e) {
+        if (!cancelled) toast(`Não consegui ir até a primeira mensagem: ${errorText(e)}`, 'error');
+      } finally {
+        if (firstMessageJump.peek()?.n === firstJump.n) firstMessageJump.value = null;
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [firstJump?.n, c.sid]);
+
   const onScroll = () => {
     const el = scroller.current!;
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
@@ -679,6 +759,7 @@ export function Chat({ c }: { c: ChatTab }) {
               </time>
             )}
             {canPin && <PinMsgButton c={c} anchor={it.uuid!} role="user" text={it.text} at={it.at} hasImages={it.images.length > 0} />}
+            {c.model.canResend(it as UserItem) && <ResendMsgButton c={c} item={it as UserItem} />}
           </div>
         );
       }
@@ -807,12 +888,20 @@ export function Chat({ c }: { c: ChatTab }) {
   return (
     <div class="chat">
       <ChatHeader c={c} />
+      <OrqBanner c={c} />
       <div class="messages" ref={scroller} onScroll={onScroll}>
         <div class="msg-wrap">
           {c.hasMore.value && (
             <div class="load-earlier">
               <button class="btn secondary" onClick={() => loadEarlier(c).catch((e) => toast(errorText(e), 'error'))}>
                 <Icon name="history" /> Carregar mensagens anteriores
+              </button>
+              <button
+                class="btn secondary"
+                onClick={() => jumpToFirstMessage(c.sid)}
+                title="Carregar todo o histórico anterior e ir para a solicitação inicial"
+              >
+                <Icon name="arrow-up" /> Ir para a primeira mensagem
               </button>
             </div>
           )}
@@ -855,10 +944,24 @@ export function Chat({ c }: { c: ChatTab }) {
             </div>
           )}
           {st.phase === 'error' && st.error && (
-            <div class="notice error">
+            <div class="notice error" style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
               <Icon name="error" style={{ fontSize: 14 }} />
-              <span style={{ flex: 1 }}>{st.error}</span>
-              <button class="btn secondary" style={{ height: 22 }} onClick={() => rpc.call('sessions.start', { sid: c.sid }).catch((e) => toast(errorText(e), 'error'))}>
+              <span style={{ flex: 1, minWidth: 200 }}>{st.error}</span>
+              {(st.error.includes('Antigravity') || st.error.includes('noagy')) && (
+                <button
+                  class="btn primary"
+                  style={{ height: 24, fontSize: 11, padding: '0 10px', display: 'inline-flex', alignItems: 'center', gap: 4 }}
+                  disabled={installingAgy.value.has(st.hostId)}
+                  onClick={async () => {
+                    const ok = await installHostAgy(st.hostId);
+                    if (ok) rpc.call('sessions.start', { sid: c.sid }).catch((e) => toast(errorText(e), 'error'));
+                  }}
+                >
+                  <Icon name={installingAgy.value.has(st.hostId) ? 'loading' : 'cloud-download'} class={installingAgy.value.has(st.hostId) ? 'spin' : ''} />
+                  {installingAgy.value.has(st.hostId) ? 'Instalando…' : 'Instalar Antigravity CLI'}
+                </button>
+              )}
+              <button class="btn secondary" style={{ height: 24 }} onClick={() => rpc.call('sessions.start', { sid: c.sid }).catch((e) => toast(errorText(e), 'error'))}>
                 Tentar de novo
               </button>
             </div>
@@ -970,6 +1073,40 @@ function ChatHeader({ c }: { c: ChatTab }) {
       <span class="path" title={st.cwd}>
         <span>{tildify(st.cwd, homeOf(st.hostId))}</span>
       </span>
+      <button
+        class="engine-chip"
+        title={`Motor da conversa: ${st.engine === 'antigravity' ? 'Antigravity CLI (agy)' : 'Claude Code'}. Clique para alternar.`}
+        onClick={(e) => {
+          const hasAgy = hostStatus.value[st.hostId]?.agy;
+          const isInstalling = installingAgy.value.has(st.hostId);
+          openMenu(e as any, [
+            {
+              label: `Claude Code${(!st.engine || st.engine === 'claude') ? '  ✓' : ''}`,
+              icon: 'hubot',
+              action: () => setChatEngine(c, 'claude'),
+            },
+            hasAgy
+              ? {
+                  label: `Antigravity CLI (agy)${st.engine === 'antigravity' ? '  ✓' : ''}`,
+                  icon: 'sparkle',
+                  action: () => setChatEngine(c, 'antigravity'),
+                }
+              : {
+                  label: isInstalling ? 'Instalando Antigravity CLI…' : 'Antigravity CLI (não instalado — instalar agora)',
+                  icon: isInstalling ? 'loading' : 'cloud-download',
+                  disabled: isInstalling,
+                  action: async () => {
+                    const ok = await installHostAgy(st.hostId);
+                    if (ok) setChatEngine(c, 'antigravity');
+                  },
+                },
+          ]);
+        }}
+      >
+        <Icon name={st.engine === 'antigravity' ? 'sparkle' : 'hubot'} style={{ fontSize: 12, color: st.engine === 'antigravity' ? '#8ab4f8' : 'var(--claude)' }} />
+        <span>{st.engine === 'antigravity' ? 'Antigravity (agy)' : 'Claude Code'}</span>
+        <Icon name="chevron-down" style={{ fontSize: 9, opacity: 0.6, marginLeft: 2 }} />
+      </button>
       <span class={`phase-pill ${phase}`} title={st.error ?? ''}>
         {phase === 'running' ? <Icon name="loading" class="spin" style={{ fontSize: 11 }} /> : <Icon name="circle-filled" style={{ fontSize: 8 }} />}
         {PHASE_TEXT[phase] ?? phase}
@@ -998,6 +1135,15 @@ function ChatHeader({ c }: { c: ChatTab }) {
         <Icon name={pinCount ? 'pinned' : 'pin'} />
         {pinCount > 0 && <span class="pins-count">{pinCount}</span>}
       </button>
+      <button
+        class="icon-btn"
+        title="Ir para a primeira mensagem (solicitação inicial do chat)"
+        aria-label="Ir para a primeira mensagem"
+        disabled={c.model.items.length === 0}
+        onClick={() => jumpToFirstMessage(c.sid)}
+      >
+        <Icon name="arrow-up" />
+      </button>
       <button class="icon-btn" title="Histórico de conversas desta pasta" onClick={() => ((sidebarView.value = 'history'), (sidebarVisible.value = true))}>
         <Icon name="history" />
       </button>
@@ -1009,7 +1155,15 @@ function ChatHeader({ c }: { c: ChatTab }) {
         title="Mais"
         onClick={(e) =>
           openMenu(e as any, [
+            {
+              label: 'Ir para a primeira mensagem',
+              icon: 'arrow-up',
+              kb: 'Ctrl+Home',
+              disabled: c.model.items.length === 0,
+              action: () => jumpToFirstMessage(c.sid),
+            },
             { label: 'Renomear conversa', icon: 'edit', kb: 'F2', action: rename },
+            { label: isChatPinned(c.sid) ? 'Desafixar aba' : 'Fixar aba (sempre no começo)', icon: isChatPinned(c.sid) ? 'pinned' : 'pin', action: () => toggleChatPinned(c.sid) },
             {
               label: isPending(st.hostId, st.sessionId) ? 'Desmarcar pendência' : 'Marcar como pendente de visualização',
               icon: 'bookmark', disabled: !st.sessionId,
@@ -1017,6 +1171,9 @@ function ChatHeader({ c }: { c: ChatTab }) {
             },
             { label: 'Nova conversa na mesma pasta', icon: 'add', action: () => newChat(st.hostId, st.cwd) },
             { label: 'Nova conversa em outra pasta…', icon: 'folder-opened', action: () => (folderBrowser.value = { hostId: st.hostId, purpose: 'chat' }) },
+            ...(orqSupported.value
+              ? [{ label: 'Novo orquestrador nesta pasta…', icon: 'organization', action: () => openNewOrchestrator(st.hostId, st.cwd) }]
+              : []),
             { separator: true },
             {
               label: 'Uso do contexto',

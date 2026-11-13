@@ -60,3 +60,42 @@ export function findLocalClaude(override?: string): ClaudeBinary[] {
   }
   return found.sort((a, b) => compareVersions(b.version, a.version));
 }
+
+export function findLocalAgy(override?: string): ClaudeBinary[] {
+  const home = os.homedir();
+  const exe = process.platform === 'win32' ? 'agy.exe' : 'agy';
+  const cmd = process.platform === 'win32' ? 'agy.cmd' : 'agy';
+  const found: ClaudeBinary[] = [];
+  const add = (p: string, version: string, source: string) => {
+    try {
+      if (fs.statSync(p).isFile() && !found.some((f) => f.path.toLowerCase() === p.toLowerCase())) {
+        found.push({ path: p, version, source });
+      }
+    } catch {
+      /* não existe */
+    }
+  };
+  if (override) add(override, '999.0.0', 'configurado');
+  if (process.env.LOCALAPPDATA) {
+    add(path.join(process.env.LOCALAPPDATA, 'Programs', 'Antigravity', 'bin', cmd), '1.0.0', 'Antigravity Programs');
+    add(path.join(process.env.LOCALAPPDATA, 'Programs', 'Antigravity', 'bin', exe), '1.0.0', 'Antigravity Programs');
+  }
+  if (process.env.APPDATA) {
+    add(path.join(process.env.APPDATA, 'Antigravity', 'bin', 'agy-node.cmd'), '1.0.0', 'Antigravity Roaming');
+    add(path.join(process.env.APPDATA, 'npm', 'agy.cmd'), '1.0.0', 'npm');
+    add(path.join(process.env.APPDATA, 'npm', 'agy'), '1.0.0', 'npm');
+  }
+  add(path.join(home, '.local', 'bin', exe), '1.0.0', 'instalador nativo');
+  add(path.join(home, '.local', 'bin', cmd), '1.0.0', 'instalador nativo');
+  add(path.join(home, '.gemini', 'antigravity', 'bin', exe), '1.0.0', 'gemini antigravity');
+  add(path.join(home, '.gemini', 'antigravity', 'bin', cmd), '1.0.0', 'gemini antigravity');
+
+  const pathDirs = (process.env.PATH || '').split(path.delimiter);
+  for (const d of pathDirs) {
+    add(path.join(d, cmd), '1.0.0', 'PATH');
+    add(path.join(d, exe), '1.0.0', 'PATH');
+    add(path.join(d, 'agy-node.cmd'), '1.0.0', 'PATH');
+  }
+
+  return found.sort((a, b) => compareVersions(b.version, a.version));
+}

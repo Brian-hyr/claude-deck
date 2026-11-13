@@ -3,7 +3,7 @@
 import crypto from 'node:crypto';
 import path from 'node:path';
 import type { OpenTarget } from '../shared/openwin';
-import { LOCAL_HOST_ID, type SessionState, type UiState } from '../shared/types';
+import { LOCAL_HOST_ID, type SessionState, type UiState, type WindowBounds } from '../shared/types';
 
 export interface WindowRecord {
   state: UiState;
@@ -11,6 +11,8 @@ export interface WindowRecord {
   hostId?: string;
   contextCwd?: string;
   shouldRestore?: boolean;
+  /** Onde a janela estava na tela (lido pelo servidor no Windows); reaplicado quando ela reabre. */
+  placement?: WindowBounds;
 }
 
 export type WindowMap = Record<string, WindowRecord>;

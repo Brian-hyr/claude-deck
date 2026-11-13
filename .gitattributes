@@ -1,0 +1,6 @@
+# Scripts que rodam no servidor (sh/node no Linux): sempre LF, mesmo num checkout do Windows com core.autocrlf=true.
+# Com CRLF o sh falha ("Syntax error: word unexpected (expecting "in")") e o shebang vira "node\r".
+*.sh text eol=lf
+test/fake-claude/*.mjs text eol=lf
+# Projeto de teste: bytes exatos (os testes conferem tamanhos e o PDF/imagens não podem ser "convertidos").
+test/fixtures/** -text

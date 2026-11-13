@@ -1,16 +1,19 @@
 // Estado global da interface (signals) + ações que conversam com o servidor local.
 import { batch, computed, effect, signal, type Signal } from '@preact/signals';
 import { rpc, RpcError } from './rpc';
-import { ChatModel, type ImageData } from './chatModel';
+import { ChatModel, type ImageData, type UserItem } from './chatModel';
 import { autoCompactFromResponse, type DetailedContextUsage, parseDetailedContextUsage } from './contextUsage';
 import { isFilePublishing, reportFileEdits, syncFileCopies, wireFileCopies } from './fileCopy';
 import {
   DEFAULT_SETTINGS,
   LOCAL_HOST_ID,
+  type AgentEngine,
   type ClaudeUpdateResult,
   type HostInfo,
   type HostStatus,
   type EffortLevel,
+  type OrchestrationView,
+  type OrqEffort,
   type PersistedChatTab,
   type PinnedMessage,
   type PermissionMode,
@@ -19,13 +22,15 @@ import {
   type Settings,
   type UiState,
   type TerminalTabInfo,
+  type ClaudeSettingsScope,
+  type ClaudeSettingsGetResult,
 } from '../../shared/types';
 import type { AuthPrompt } from '../../shared/protocol';
 import { basename, dirname, extname, normalize, relativeTo, tildify } from '../../shared/paths';
 import { decodeOpen } from '../../shared/openwin';
 import { isNewerVersion } from '../../shared/version';
 import { activityPrefix, chatActivity } from './activity';
-import { lastActivityOf, scheduleTabSort, sortTabs } from './tabOrder';
+import { arrangeTabs, lastActivityOf, scheduleTabSort, sortTabsGrouped, tabSegments, visibleTabs, type TabLayout } from './tabOrder';
 
 // ------------------------------------------------------------------ tipos da tela
 
@@ -96,6 +101,12 @@ export let windowId = '';
  * (antes do "encerrada"): elas não voltam como aba fantasma, sem processo por trás.
  */
 const closedSids = new Set<string>();
+/** O servidor tem o orquestrador (`orq.*`); servidor antigo: o botão some. */
+export const orqSupported = signal(false);
+/** Orquestrações desta janela, por id (atualizadas pelo evento `orq.update`). */
+export const orchestrations = signal<Record<string, OrchestrationView>>({});
+/** Diálogo "Novo orquestrador" aberto para este servidor+pasta. */
+export const newOrqDialog = signal<{ hostId: string; cwd: string } | null>(null);
 /** Reabrir enquanto o fechamento ainda está no servidor espera o fim dele. */
 const closingConversations = new Map<string, Promise<void>>();
 /**
@@ -152,6 +163,10 @@ export const renamingSid = signal<string | null>(null);
 export const tabDragging = signal(false);
 /** Sobe a cada reordenação automática/manual das abas: a faixa de abas rola até a ativa. */
 export const tabOrderStamp = signal(0);
+/** Abas fixadas desta janela (sids). Ficam sempre no começo da faixa, na ordem em que estão em `chats`. */
+export const pinnedTabs = signal<ReadonlySet<string>>(new Set());
+/** Grupos de abas recolhidos nesta janela (id da orquestração). */
+export const collapsedTabGroups = signal<ReadonlySet<string>>(new Set());
 export const files = signal<FileTab[]>([]);
 export const activeFileId = signal<string | null>(null);
 export const workspace = signal<Workspace | null>(null);
@@ -258,6 +273,15 @@ export const messageJump = signal<{ sid: string; anchor: string; n: number } | n
 let messageJumpSeq = 0;
 export function jumpToMessage(sid: string, anchor: string) {
   messageJump.value = { sid, anchor, n: ++messageJumpSeq };
+}
+
+/**
+ * Pedido para rolar a conversa até a primeira mensagem (solicitação inicial).
+ */
+export const firstMessageJump = signal<{ sid: string; n: number } | null>(null);
+let firstMessageJumpSeq = 0;
+export function jumpToFirstMessage(sid: string) {
+  firstMessageJump.value = { sid, n: ++firstMessageJumpSeq };
 }
 
 function applyPinChange(pin: PinnedMessage, pinned: boolean) {
@@ -421,9 +445,9 @@ export function closeDialog(id: number, value: string | boolean | null) {
 }
 
 /** Seletor de servidor/pasta para nova conversa (quick pick). */
-export const newChatPicker = signal<{ hostId?: string } | null>(null);
+export const newChatPicker = signal<{ hostId?: string; engine?: AgentEngine } | null>(null);
 /** Navegador de pastas (para abrir outra pasta, escolher pasta da conversa ou fixar uma pasta extra). */
-export const folderBrowser = signal<{ hostId: string; start?: string; purpose: 'workspace' | 'chat' | 'add-root' | 'move'; move?: { path: string; dir: boolean } } | null>(null);
+export const folderBrowser = signal<{ hostId: string; start?: string; purpose: 'workspace' | 'chat' | 'add-root' | 'move' | 'orq'; move?: { path: string; dir: boolean } } | null>(null);
 
 /** Fixa uma pasta extra no explorador (sem trocar a raiz do workspace). */
 export function addExtraRoot(hostId: string, root: string) {
@@ -450,6 +474,45 @@ export function closeContextModal() {
   contextModalSid.value = null;
 }
 
+export interface ClaudeSettingsModalState {
+  hostId: string;
+  cwd?: string;
+  scope?: ClaudeSettingsScope;
+  initialTab?: "api" | "models" | "permissions" | "effort" | "json";
+}
+
+export const claudeSettingsModal = signal<ClaudeSettingsModalState | null>(null);
+
+export function openClaudeSettingsModal(opts?: Partial<ClaudeSettingsModalState>) {
+  const hostId = opts?.hostId ?? windowHostId();
+  const cwd = opts?.cwd ?? workspace.value?.root ?? activeChat.value?.state.value.cwd;
+  const scope = opts?.scope ?? (cwd ? "project" : "user");
+  claudeSettingsModal.value = {
+    hostId,
+    cwd,
+    scope,
+    initialTab: opts?.initialTab ?? "api",
+  };
+}
+
+export function closeClaudeSettingsModal() {
+  claudeSettingsModal.value = null;
+}
+
+export async function openClaudeSettingsFile(hostId?: string, scope: ClaudeSettingsScope = "user", cwd?: string) {
+  const hId = hostId ?? windowHostId();
+  const projectCwd = cwd ?? workspace.value?.root ?? activeChat.value?.state.value.cwd;
+  try {
+    const r = await rpc.call<ClaudeSettingsGetResult>("claudeSettings.get", { hostId: hId, scope, cwd: projectCwd });
+    if (!r.exists) {
+      await rpc.call("claudeSettings.save", { hostId: hId, scope, cwd: projectCwd, settings: {} });
+    }
+    await openFile(hId, r.path, { mode: "edit" });
+  } catch (e) {
+    toast(`Não foi possível abrir o settings.json: ${errorText(e)}`, "error");
+  }
+}
+
 export async function fetchDetailedContext(sid: string): Promise<DetailedContextUsage> {
   const res = await rpc.call('sessions.control', { sid, request: { subtype: 'get_context_usage' } }, 45_000);
   const usage = parseDetailedContextUsage(res);
@@ -465,11 +528,15 @@ function saveUiState() {
   if (!ready.value) return;
   clearTimeout(saveTimer);
   saveTimer = window.setTimeout(() => {
+    const pins = pinnedTabs.value;
+    // Só os grupos que ainda existem nesta janela (orquestração cujas abas foram todas fechadas sai da lista).
+    const groups = new Set(chats.value.map((c) => c.state.value.orq?.id).filter(Boolean));
     const st: UiState = {
       chatTabs: [
-        ...chats.value.map((c) => ({ sid: c.sid, hostId: c.state.value.hostId, cwd: c.state.value.cwd })),
+        ...chats.value.map((c) => ({ sid: c.sid, hostId: c.state.value.hostId, cwd: c.state.value.cwd, ...(pins.has(c.sid) ? { pinned: true } : {}) })),
         ...missingRestoredTabs.filter((tab) => !chats.value.some((c) => c.sid === tab.sid)),
       ],
+      collapsedTabGroups: [...collapsedTabGroups.value].filter((id) => groups.has(id)),
       fileTabs: files.value.map((f) => ({ id: f.id, hostId: f.hostId, path: f.path, view: f.mode.value })),
       activeChat: activeChatId.value ?? undefined,
       activeFile: activeFileId.value ?? undefined,
@@ -490,6 +557,28 @@ function saveUiState() {
   }, 600);
 }
 
+/**
+ * Posição da janela no Windows: a página não consegue medir nem pôr a janela em outro monitor (o navegador
+ * prende `moveTo` à tela atual e `screenX` não usa pixels físicos com escalas diferentes por monitor). Ela só
+ * percebe que a janela mexeu e pede ao servidor, que lê a posição real (Win32) e a reaplica ao reabrir.
+ * Servidor anterior sem o método: o pedido falha calado e nada muda.
+ */
+function watchWindowPlacement() {
+  const measure = () => `${window.screenX},${window.screenY},${window.outerWidth},${window.outerHeight}`;
+  let last = measure();
+  let timer: number | undefined;
+  setInterval(() => {
+    const now = measure();
+    if (now === last) return;
+    last = now;
+    clearTimeout(timer);
+    // Espera a janela parar de mexer (arrastar dispara várias medidas seguidas).
+    timer = window.setTimeout(() => {
+      if (ready.peek() && windowId) rpc.call('window.placement').catch(() => {});
+    }, 1200);
+  }, 1000);
+}
+
 effect(() => {
   // Dependências observadas para salvar o layout.
   void chats.value;
@@ -508,6 +597,8 @@ effect(() => {
   void terminalVisible.value;
   void terminalHeight.value;
   void terminalWidth.value;
+  void pinnedTabs.value;
+  void collapsedTabGroups.value;
   saveUiState();
 });
 
@@ -628,6 +719,7 @@ async function loadAll(first: boolean) {
     settings.value = info.settings;
     pendingSupported.value = info.manualPending === true;
     pinsSupported.value = info.pins === true;
+    orqSupported.value = info.orchestrator === true;
     caps.value = info.caps ?? {};
     authPrompts.value = info.prompts ?? [];
   });
@@ -669,6 +761,7 @@ async function loadAll(first: boolean) {
   const pendingHost = att.context?.hostId ?? (sessions[0]?.hostId ?? att.state?.workspace?.hostId ?? 'local');
   await refreshPending(pendingHost);
   await refreshPins(pendingHost);
+  await refreshOrchestrations();
   batch(() => {
     hosts.value = hl;
     hostStatus.value = Object.fromEntries((sts as HostStatus[]).map((s) => [s.id, s]));
@@ -682,6 +775,8 @@ async function loadAll(first: boolean) {
     const order = [...new Set([...st.chatTabs.map((t) => t.sid).filter((sid) => byId.has(sid)), ...byId.keys()])];
     const tabs = order.map((sid) => makeChat(byId.get(sid)!));
     batch(() => {
+      pinnedTabs.value = new Set(st.chatTabs.filter((t) => t.pinned === true && byId.has(t.sid)).map((t) => t.sid));
+      collapsedTabGroups.value = new Set(Array.isArray(st.collapsedTabGroups) ? st.collapsedTabGroups.filter((id) => typeof id === 'string') : []);
       chats.value = tabs;
       activeChatId.value = st.activeChat && byId.has(st.activeChat) ? st.activeChat : (tabs[0]?.sid ?? null);
       if (st.sidebarWidth) sidebarWidth.value = st.sidebarWidth;
@@ -847,6 +942,15 @@ function onWindowShown() {
 function wireEvents() {
   window.addEventListener('focus', onWindowShown);
   document.addEventListener('visibilitychange', onWindowShown);
+  watchWindowPlacement();
+  // Marca no título só para o servidor achar esta janela no Windows (sem trazê-la para a frente).
+  rpc.on('window.mark', ({ marker }: { marker?: string } = {}) => {
+    if (!marker) return;
+    focusMarker.value = marker;
+    setTimeout(() => {
+      if (focusMarker.peek() === marker) focusMarker.value = null;
+    }, 10_000);
+  });
   rpc.on('window.focus', ({ marker, hostId, folder, resume }: { marker?: string; hostId?: string; folder?: string; resume?: string } = {}) => {
     if (marker) {
       focusMarker.value = marker;
@@ -898,6 +1002,20 @@ function wireEvents() {
     c.state.value = st;
     if (st.phase === 'running') cancelDoneNotification(st.sid);
     if (st.phase === 'idle') ensureAutoCompact(c);
+  });
+  rpc.on('orq.update', (v: OrchestrationView) => {
+    if (!v?.id) return;
+    const known = !!orchestrations.peek()[v.id];
+    // Só as desta janela (ou as que ela já mostrava): as de outras janelas não interessam aqui.
+    if (!known && v.wid !== windowId) return;
+    orchestrations.value = { ...orchestrations.peek(), [v.id]: v };
+  });
+  // O servidor fechou uma conversa (o orquestrador encerrou um worker): a aba sai daqui também.
+  rpc.on('session.closed', ({ sid }: { sid: string }) => {
+    if (!chats.peek().some((x) => x.sid === sid)) return;
+    closedSids.add(sid);
+    dropChatTab(sid);
+    setTimeout(() => closedSids.delete(sid), 30_000);
   });
   rpc.on('session.msg', ({ sid, seq, msg }) => {
     const c = chats.value.find((x) => x.sid === sid);
@@ -1055,6 +1173,9 @@ export async function loadChat(c: ChatTab) {
     }
     c.queued = [];
     c.loaded = true;
+    if (c.state.value.phase !== 'running') {
+      c.model.finalizePendingTurn();
+    }
     if (c.model.pendingCount) c.attention.value = 'permission';
   } catch (e) {
     c.loadError.value = errorText(e);
@@ -1074,6 +1195,9 @@ async function resync(c: ChatTab) {
     c.lastSeq = m.seq;
     c.model.apply(m.msg, { replay: true });
   }
+  if (c.state.value.phase !== 'running') {
+    c.model.finalizePendingTurn();
+  }
   bump(c);
 }
 
@@ -1083,6 +1207,7 @@ export async function loadEarlier(c: ChatTab) {
   const page = await rpc.call('history.load', { h: st.hostId, file: c.historyFile, before: c.historyStart }, 120_000);
   const older = new ChatModel();
   for (const line of page.lines) older.apply(line, { history: true });
+  older.finalizePendingTurn();
   c.model.prepend(older);
   c.historyStart = page.start;
   c.hasMore.value = page.start > 0;
@@ -1105,7 +1230,7 @@ export function activateChat(sid: string) {
  * Nova conversa (ou retomada do histórico). Se o servidor+pasta não é o desta janela, ela vai para
  * a janela daquele servidor+pasta (abrindo ou trazendo para a frente) e devolve `undefined`.
  */
-export async function newChat(hostId: string, cwd: string, opts: { resume?: string; title?: string; replaceSid?: string } = {}): Promise<ChatTab | undefined> {
+export async function newChat(hostId: string, cwd: string, opts: { resume?: string; title?: string; replaceSid?: string; engine?: AgentEngine; model?: string } = {}): Promise<ChatTab | undefined> {
   if (!isThisWindow(hostId, cwd)) {
     await openHostWindow(hostId, cwd, opts.resume);
     return undefined;
@@ -1118,7 +1243,8 @@ export async function newChat(hostId: string, cwd: string, opts: { resume?: stri
       resume: opts.resume,
       title: opts.title,
       permissionMode: settings.value.defaultPermissionMode,
-      model: settings.value.defaultModel || undefined,
+      model: opts.model ?? ((opts.engine ?? settings.value.defaultEngine ?? 'claude') === 'antigravity' ? undefined : (settings.value.defaultModel || undefined)),
+      engine: opts.engine ?? settings.value.defaultEngine ?? 'claude',
       start: !opts.resume,
     });
   } catch (e) {
@@ -1138,6 +1264,18 @@ export async function newChat(hostId: string, cwd: string, opts: { resume?: stri
     if (idx >= 0) list.splice(idx + 1, 0, c);
     else list.push(c);
     chats.value = list;
+  }
+  // /clear numa aba fixada: a conversa nova fica fixada no lugar dela. A aba nova pode já ter chegado
+  // pelo evento `session.state` (no fim da faixa): vai para logo depois da antiga antes de fixar.
+  if (opts.replaceSid && pinnedTabs.peek().has(opts.replaceSid) && !pinnedTabs.peek().has(c.sid)) {
+    const nc = c;
+    const list = chats.peek().filter((x) => x.sid !== nc.sid);
+    const at = list.findIndex((x) => x.sid === opts.replaceSid);
+    list.splice(at >= 0 ? at + 1 : list.length, 0, nc);
+    batch(() => {
+      pinnedTabs.value = new Set([...pinnedTabs.peek(), nc.sid]);
+      chats.value = list;
+    });
   }
   if (opts.replaceSid) await closeChat(opts.replaceSid, true);
   activeChatId.value = c.sid;
@@ -1241,17 +1379,7 @@ export async function closeChat(sid: string, silent = false) {
     if (!ok) return;
   }
   closedSids.add(sid);
-  const idx = chats.value.findIndex((x) => x.sid === sid);
-  const list = chats.value.filter((x) => x.sid !== sid);
-  chats.value = list;
-  if (activeChatId.value === sid) {
-    const next = list[Math.min(idx, list.length - 1)];
-    activeChatId.value = next?.sid ?? null;
-    if (next) {
-      clearPendingOnOpen(next);
-      loadChat(next);
-    }
-  }
+  dropChatTab(sid);
   const key = st.sessionId ? `${st.hostId}\n${st.sessionId}` : undefined;
   const done = rpc.call('sessions.close', { sid }).then(
     () => { closedSids.delete(sid); },
@@ -1270,13 +1398,192 @@ export async function closeChat(sid: string, silent = false) {
   }
 }
 
+/** Tira a aba da tela (a ativa passa para a vizinha). Não fala com o servidor. */
+function dropChatTab(sid: string) {
+  const idx = chats.value.findIndex((x) => x.sid === sid);
+  if (idx < 0) return;
+  const list = chats.value.filter((x) => x.sid !== sid);
+  batch(() => {
+    if (pinnedTabs.peek().has(sid)) {
+      const pins = new Set(pinnedTabs.peek());
+      pins.delete(sid);
+      pinnedTabs.value = pins;
+    }
+    chats.value = list;
+  });
+  if (activeChatId.value === sid) {
+    // A vizinha que está à vista (a escondida num grupo recolhido não serve), como antes: a da direita, senão a da esquerda.
+    const shown = new Set(tabStrip.peek().visible.map((x) => x.sid));
+    const next = list.slice(idx).find((x) => shown.has(x.sid)) ?? [...list.slice(0, idx)].reverse().find((x) => shown.has(x.sid)) ?? list[Math.min(idx, list.length - 1)];
+    activeChatId.value = next?.sid ?? null;
+    if (next) {
+      clearPendingOnOpen(next);
+      loadChat(next);
+    }
+  }
+}
+
+// ------------------------------------------------------------------ orquestrador
+
+async function refreshOrchestrations() {
+  if (!orqSupported.peek()) {
+    orchestrations.value = {};
+    return;
+  }
+  try {
+    const list = await rpc.call<OrchestrationView[]>('orq.list');
+    orchestrations.value = Object.fromEntries(list.map((o) => [o.id, o]));
+  } catch {
+    /* servidor antigo ou desconectado: fica como estava */
+  }
+}
+
+/** A orquestração de que a conversa faz parte (orquestrador ou worker). */
+export function orqOf(st: SessionState): OrchestrationView | undefined {
+  return st.orq ? orchestrations.value[st.orq.id] : undefined;
+}
+
+/**
+ * Abre o diálogo "Novo orquestrador" na pasta das conversas desta janela (ou da aba/explorador). Janela
+ * sem pasta: primeiro escolhe a pasta do projeto.
+ */
+export function openNewOrchestrator(hostId?: string, cwd?: string) {
+  if (!orqSupported.peek()) {
+    toast('O servidor do Claude Deck em execução ainda não tem o orquestrador. Ele passa a valer quando o daemon for atualizado.', 'error', 7000);
+    return;
+  }
+  const act = activeChat.peek()?.state.peek();
+  const ws = workspace.peek();
+  const ctx =
+    hostId && cwd
+      ? { hostId, cwd }
+      : (windowContext.peek() ?? (act ? { hostId: act.hostId, cwd: act.cwd } : ws ? { hostId: ws.hostId, cwd: ws.root } : null));
+  if (ctx) newOrqDialog.value = ctx;
+  else folderBrowser.value = { hostId: windowHostId(), purpose: 'orq' };
+}
+
+export interface NewOrqOptions {
+  hostId: string;
+  cwd: string;
+  goal: string;
+  title?: string;
+  workerPermissionMode: PermissionMode;
+  maxParallel: number;
+  requireApproval: boolean;
+  model?: string;
+  effort: OrqEffort;
+  workerModel?: string;
+}
+
+/** Cria o orquestrador (uma aba nova nesta janela) e já manda o objetivo para ele começar a planejar. */
+export async function createOrchestration(o: NewOrqOptions): Promise<ChatTab | undefined> {
+  if (!isThisWindow(o.hostId, o.cwd)) {
+    toast('O orquestrador é criado na janela da pasta do projeto. Abra a janela dessa pasta e crie por lá.', 'error', 7000);
+    await openHostWindow(o.hostId, o.cwd);
+    return undefined;
+  }
+  const r = await rpc.call<{ orchestration: OrchestrationView; state: SessionState }>('orq.create', { ...o, permissionMode: settings.value.defaultPermissionMode }, 120_000);
+  orchestrations.value = { ...orchestrations.peek(), [r.orchestration.id]: r.orchestration };
+  if (!windowContext.value) windowContext.value = { hostId: o.hostId, cwd: r.state.cwd };
+  const c = showOwnConversation(r.state);
+  return c;
+}
+
+export async function orqAction(id: string, action: 'approve' | 'pause' | 'resume' | 'stopWorkers' | 'cancel') {
+  try {
+    if (action === 'approve') await rpc.call('orq.approve', { id });
+    else if (action === 'pause' || action === 'resume') await rpc.call('orq.pause', { id, paused: action === 'pause' });
+    else if (action === 'stopWorkers') {
+      const n = await rpc.call<number>('orq.stopWorkers', { id });
+      toast(n ? `${n} worker(s) interrompido(s); a orquestração foi pausada.` : 'Nenhum worker estava trabalhando; a orquestração foi pausada.');
+    } else if (action === 'cancel') {
+      const ok = await confirmDialog('Cancelar a orquestração?', 'Os workers que estiverem trabalhando são interrompidos e o orquestrador deixa de receber eventos. As conversas e os arquivos continuam como estão.', 'Cancelar orquestração', true);
+      if (!ok) return;
+      await rpc.call('orq.cancel', { id });
+    }
+  } catch (e) {
+    toast(`Não consegui: ${errorText(e)}`, 'error');
+  }
+}
+
 export function moveChat(sid: string, toIndex: number) {
   const list = [...chats.value];
   const from = list.findIndex((c) => c.sid === sid);
   if (from < 0) return;
   const [c] = list.splice(from, 1);
   list.splice(Math.max(0, Math.min(toIndex, list.length)), 0, c);
+  // A arrumação (efeito abaixo) segura as regras: fixada não sai da área das fixadas, solta não entra
+  // nela, e o grupo continua junto (arrastar o orquestrador leva o grupo).
   chats.value = list;
+}
+
+// ------------------------------------------------------------------ abas fixadas e grupos
+
+/** Posição da aba na faixa: fixada ou membro do grupo da orquestração (o orquestrador é a âncora). */
+function tabLayout(c: ChatTab, pins: ReadonlySet<string> = pinnedTabs.peek()): TabLayout {
+  const r = c.state.peek().orq;
+  return { pinned: pins.has(c.sid), group: r?.id, anchor: r?.role === 'orchestrator' };
+}
+
+/** A conversa precisa de você (permissão, pergunta, plano; ou o plano/pedido do orquestrador): nunca some num grupo recolhido. */
+export function tabNeedsYou(c: ChatTab): boolean {
+  void c.version.value; // `pendingCount` não é signal
+  if (c.attention.value === 'permission' || c.model.pendingCount > 0) return true;
+  const st = c.state.value;
+  if (st.orq?.role !== 'orchestrator') return false;
+  const o = orqOf(st);
+  return !!o && (o.status === 'awaiting_approval' || o.status === 'stalled' || o.status === 'waiting_user');
+}
+
+/** Faixa de abas como aparece: pedaços (abas soltas e grupos) e as abas à vista, na ordem. */
+export const tabStrip = computed(() => {
+  const pins = pinnedTabs.value;
+  const collapsed = collapsedTabGroups.value;
+  const active = activeChatId.value;
+  const segments = tabSegments(chats.value, (c) => tabLayout(c, pins), { collapsed, keepVisible: (c) => c.sid === active || tabNeedsYou(c) });
+  return { segments, visible: visibleTabs(segments) };
+});
+
+// Mantém a faixa arrumada: fixadas no começo e cada grupo junto. Toda aba nova (worker criado pelo
+// orquestrador, conversa reaberta, reconexão) entra no fim e é puxada para o lugar dela aqui.
+effect(() => {
+  const list = chats.value;
+  const pins = pinnedTabs.value;
+  const next = arrangeTabs(list, (c) => tabLayout(c, pins));
+  if (next !== list) chats.value = [...next];
+});
+
+export function isChatPinned(sid: string): boolean {
+  return pinnedTabs.value.has(sid);
+}
+
+/**
+ * Fixa/desafixa a aba. Fixada vai para o fim das fixadas (a 1ª, a 2ª, a 3ª… na ordem em que foram
+ * fixadas; arrastar entre elas muda a ordem). Desafixada vai para o começo das outras. Gravado com a
+ * janela: volta igual ao reabrir.
+ */
+export function setChatPinned(sid: string, pinned: boolean) {
+  const cur = pinnedTabs.peek();
+  if (cur.has(sid) === pinned || !chats.peek().some((c) => c.sid === sid)) return;
+  const next = new Set(cur);
+  if (pinned) next.add(sid);
+  else next.delete(sid);
+  pinnedTabs.value = next;
+  tabOrderStamp.value++;
+}
+
+export function toggleChatPinned(sid: string) {
+  setChatPinned(sid, !pinnedTabs.peek().has(sid));
+}
+
+/** Recolhe/expande o grupo de abas (como os grupos de abas do navegador). */
+export function setTabGroupCollapsed(id: string, collapsed: boolean) {
+  const cur = collapsedTabGroups.peek();
+  if (cur.has(id) === collapsed) return;
+  const next = new Set(cur);
+  if (collapsed) next.add(id);
+  else next.delete(id);
+  collapsedTabGroups.value = next;
 }
 
 /**
@@ -1299,19 +1606,24 @@ export function reorderChatsByActivity(knownPending?: ReadonlySet<string>): bool
   const cur = chats.peek();
   const ids = new Set(cur.map((c) => c.sid));
   for (const sid of observedActivity.keys()) if (!ids.has(sid)) observedActivity.delete(sid);
-  const next = sortTabs(cur, (c) => {
-    const st = c.state.peek();
-    return {
-      attention: c.attention.peek(),
-      // Aba ainda não aberta nesta janela: o modelo dela está vazio, o pedido pendente vem da sondagem.
-      pendingCount: Math.max(c.model.pendingCount, knownPending?.has(c.sid) ? 1 : 0),
-      phase: st.phase,
-      modelRunning: c.model.running,
-      unseen: st.unseen,
-      manualPending: isPending(st.hostId, st.sessionId),
-      lastActivityAt: lastActivityOf(st, observedActivity.get(c.sid)),
-    };
-  });
+  // As fixadas não saem do lugar; cada grupo (orquestração) se move junto, pela conversa mais urgente dele.
+  const next = sortTabsGrouped(
+    cur,
+    (c) => {
+      const st = c.state.peek();
+      return {
+        attention: c.attention.peek(),
+        // Aba ainda não aberta nesta janela: o modelo dela está vazio, o pedido pendente vem da sondagem.
+        pendingCount: Math.max(c.model.pendingCount, knownPending?.has(c.sid) ? 1 : 0),
+        phase: st.phase,
+        modelRunning: c.model.running,
+        unseen: st.unseen,
+        manualPending: isPending(st.hostId, st.sessionId),
+        lastActivityAt: lastActivityOf(st, observedActivity.get(c.sid)),
+      };
+    },
+    (c) => tabLayout(c),
+  );
   if (next.every((c, i) => c === cur[i])) return false;
   chats.value = next;
   tabOrderStamp.value++;
@@ -1426,6 +1738,18 @@ export async function sendMessage(c: ChatTab, text: string, images: ImageData[],
   }
 }
 
+/**
+ * Reenvia, como mensagem nova, uma que você mandou com o Claude trabalhando e que ele pode ter deixado sem resposta.
+ * Só vale depois que a tarefa acabou (ver `ChatModel.canResend`): a nova abre um turno de verdade, que o modelo responde.
+ * O original fica na conversa (o texto idêntico logo abaixo mostra o que aconteceu); só perde o botão.
+ */
+export async function resendMessage(c: ChatTab, it: UserItem) {
+  if (!it.uuid || !c.model.canResend(it)) return;
+  c.model.markResent(it.uuid);
+  c.version.value++;
+  await sendMessage(c, it.text, it.images);
+}
+
 export async function respondPermission(c: ChatTab, requestId: string, response: any, label?: string) {
   c.model.answered(requestId, response.behavior === 'allow' ? 'allowed' : 'denied', label);
   if (!c.model.pendingCount && c.attention.value === 'permission') c.attention.value = null;
@@ -1454,6 +1778,17 @@ export async function setChatMode(c: ChatTab, mode: PermissionMode) {
   }
 }
 
+export async function setChatAutoApprove(c: ChatTab, on: boolean) {
+  try {
+    await rpc.call('sessions.setAutoApprove', { sid: c.sid, on });
+    if (on && !c.model.pendingCount && c.attention.value === 'permission') c.attention.value = null;
+    toast(on ? 'Aprovar sozinho ligado: pedidos de permissão desta conversa serão aceitos automaticamente.' : 'Aprovar sozinho desligado.', on ? 'success' : 'info', 3500);
+  } catch (e) {
+    // Daemon antigo não conhece o método: avisa em vez de falhar calado.
+    toast(/unknown|desconhecid|not found|não existe/i.test(errorText(e)) ? 'Este recurso exige reiniciar o Claude Deck (daemon desatualizado).' : errorText(e), 'error');
+  }
+}
+
 export async function setChatModel(c: ChatTab, model: string | null) {
   try {
     // Conferido com o CLI real: a 2.1.289 (a da extensão do VS Code) aplica a troca já na próxima chamada ao
@@ -1462,6 +1797,17 @@ export async function setChatModel(c: ChatTab, model: string | null) {
     const working = c.model.running || c.model.pendingCount > 0;
     await rpc.call('sessions.setModel', { sid: c.sid, model });
     toast(`Modelo: ${model || 'padrão do servidor'}${working ? ' (vale a partir da próxima ação do Claude; em Claude Code antigo, só na próxima mensagem)' : ''}`, 'success', working ? 6000 : 2500);
+  } catch (e) {
+    toast(errorText(e), 'error');
+  }
+}
+
+export async function setChatEngine(c: ChatTab, engine: AgentEngine) {
+  try {
+    await rpc.call('sessions.setEngine', { sid: c.sid, engine });
+    c.state.value = { ...c.state.value, engine };
+    c.version.value++;
+    toast(`Motor: ${engine === 'antigravity' ? 'Antigravity CLI (agy)' : 'Claude Code'}`, 'success', 2500);
   } catch (e) {
     toast(errorText(e), 'error');
   }
@@ -1747,6 +2093,40 @@ export async function updateHostClaude(hostId: string) {
       );
   } catch (e) {
     toast(`Não atualizei o Claude Code em ${label}: ${errorText(e)}`, 'error', 14000);
+  } finally {
+    mark(false);
+  }
+}
+
+/** Servidores cujo Antigravity CLI está sendo instalado agora. */
+export const installingAgy = signal<Set<string>>(new Set());
+
+/** Botão "Instalar Antigravity CLI": confirma, roda o instalador no servidor e recarrega o status. */
+export async function installHostAgy(hostId: string): Promise<boolean> {
+  if (installingAgy.value.has(hostId)) return false;
+  const label = hostLabel(hostId);
+  const ok = await confirmDialog(
+    `Instalar Antigravity CLI em ${label}?`,
+    `O Deck executará o script oficial de instalação (${hostId === LOCAL_HOST_ID ? 'Windows' : 'Linux/macOS'}) no servidor.\nIsso pode levar de 1 a 3 minutos dependendo da conexão.`,
+    'Instalar agora',
+  );
+  if (!ok) return false;
+  const mark = (on: boolean) => {
+    const next = new Set(installingAgy.value);
+    if (on) next.add(hostId);
+    else next.delete(hostId);
+    installingAgy.value = next;
+  };
+  mark(true);
+  toast(`Instalando Antigravity CLI em ${label}…`, 'info', 10_000);
+  try {
+    const r = await rpc.call<{ version: string; output: string }>('hosts.installAgy', { id: hostId }, 330_000);
+    toast(`Antigravity CLI (${r.version}) instalado com sucesso em ${label}!`, 'success', 8000);
+    await connectHost(hostId, true).catch(() => {});
+    return true;
+  } catch (e) {
+    toast(`Não foi possível instalar Antigravity CLI em ${label}: ${errorText(e)}`, 'error', 14_000);
+    return false;
   } finally {
     mark(false);
   }

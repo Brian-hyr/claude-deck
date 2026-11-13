@@ -63,6 +63,17 @@ try {
     assert(err && /desconhecido/i.test(err), `fs.mkdirp deveria não existir: ${err}`);
   });
 
+  await step('sem orquestrador no servidor antigo: o botão e o item de menu somem (nada chama orq.* às cegas)', async () => {
+    const info = await h.rpc('app.info');
+    assert(info.orchestrator === false, `orchestrator: ${info.orchestrator}`);
+    assert(!(await page.$('.tabs-actions .icon-btn[title^="Novo orquestrador"]')), 'botão "Novo orquestrador" não deveria aparecer');
+    await page.click('.chat-header .icon-btn[title="Mais"]');
+    await page.waitForSelector('.ctxmenu', { visible: true, timeout: 5000 });
+    const items = await page.$$eval('.ctxmenu .mi', (m) => m.map((x) => x.textContent));
+    await page.keyboard.press('Escape');
+    assert(!items.some((t) => t.includes('orquestrador')), `item de orquestrador no menu: ${JSON.stringify(items)}`);
+  });
+
   await step('mapa abre com daemon antigo, mas parar/ler avisa que precisa do novo (não finge funcionar)', async () => {
     await h.send('bgagent 1');
     await waitText('.msg .md', '1 em segundo plano.');

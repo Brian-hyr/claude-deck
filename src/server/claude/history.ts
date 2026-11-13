@@ -295,7 +295,7 @@ export class HistoryService {
       const t = o.type;
       const isRelevantQueue = t === 'queue-operation' && typeof o.content === 'string' && (o.content.includes('task-notification') || o.content.includes('<agent-message'));
       const isRelevantAttachment = t === 'attachment' && (o.attachment?.type === 'task_status' || (o.attachment?.type === 'queued_command' && (typeof o.attachment?.prompt === 'string' || Array.isArray(o.attachment?.prompt))));
-      if (t !== 'user' && t !== 'assistant' && t !== 'system' && t !== 'summary' && t !== 'ai-title' && t !== 'custom-title' && !isRelevantQueue && !isRelevantAttachment) continue;
+      if (t !== 'user' && t !== 'assistant' && t !== 'system' && t !== 'summary' && t !== 'ai-title' && t !== 'custom-title' && t !== 'result' && !isRelevantQueue && !isRelevantAttachment) continue;
       if (o.isSidechain && !sidechain) continue;
       lines.push(trimLine(o));
     }
@@ -321,6 +321,47 @@ export class HistoryService {
       }
     }
     return custom || ai;
+  }
+
+  /**
+   * Primeira linha completa do transcript que contém `needle` e que `accept` aprova (o texto procurado pode
+   * aparecer também numa mensagem citada), lida em blocos a partir de `from` sem carregar o arquivo inteiro.
+   * `scannedTo` é de onde a próxima busca continua: o começo da última linha ainda incompleta (o CLI pode estar
+   * gravando). Lê no máximo `maxBytes` por chamada.
+   */
+  async findFirstLine(
+    host: HostHandle,
+    file: string,
+    needle: string,
+    accept: (line: string) => boolean = () => true,
+    from = 0,
+    maxBytes = 64 * 1024 * 1024,
+  ): Promise<{ line?: string; scannedTo: number }> {
+    const st = await host.fs.stat(file);
+    if (from > st.size) from = 0; // arquivo menor que da última vez: foi trocado, procura de novo
+    const end = Math.min(st.size, from + maxBytes);
+    const chunk = 1024 * 1024;
+    const pat = Buffer.from(needle, 'utf8');
+    let carry = Buffer.alloc(0);
+    let pos = from;
+    while (pos < end) {
+      const n = Math.min(chunk, end - pos);
+      const buf = Buffer.concat([carry, await host.fs.readBytes(file, pos, n)]);
+      pos += n;
+      // Só linhas completas: a última (ainda sem quebra de linha) volta para o próximo bloco.
+      const nl = buf.lastIndexOf(10);
+      const whole = nl >= 0 ? buf.subarray(0, nl + 1) : Buffer.alloc(0);
+      for (let hit = whole.indexOf(pat); hit >= 0; ) {
+        const stop = whole.indexOf(10, hit);
+        const line = whole.subarray(whole.lastIndexOf(10, hit) + 1, stop).toString('utf8');
+        if (accept(line)) return { line, scannedTo: pos - (buf.length - stop - 1) };
+        hit = whole.indexOf(pat, stop + 1);
+      }
+      carry = nl >= 0 ? buf.subarray(nl + 1) : buf;
+      // Linha gigante (imagem colada): não precisa ser guardada inteira, o aviso nunca está nela.
+      if (carry.length > 16 * 1024 * 1024) carry = Buffer.alloc(0);
+    }
+    return { scannedTo: pos - carry.length };
   }
 
   /** Grava um nome dado pelo usuário no transcript (como o /rename do CLI faz). */

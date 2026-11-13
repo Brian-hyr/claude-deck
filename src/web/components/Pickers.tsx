@@ -19,7 +19,11 @@ import {
   newChat,
   newChatPicker,
   openFile,
+  openNewOrchestrator,
+  isChatPinned,
+  toggleChatPinned,
   openTerminal,
+  orqSupported,
   platformOf,
   quickOpen,
   sidebarView,
@@ -32,6 +36,8 @@ import {
   workspace,
   toast,
   errorText,
+  openClaudeSettingsModal,
+  openClaudeSettingsFile,
 } from '../lib/state';
 import { QuickPick, type QPItem } from './QuickPick';
 import { Icon } from './icons';
@@ -99,7 +105,7 @@ export function NewChatPicker() {
       key={`folder:${hostId}`}
       title={
         <>
-          <Icon name="comment-discussion" /> Nova conversa em {hostLabel(hostId)} — escolha a pasta
+          <Icon name="comment-discussion" /> Nova conversa{st.engine ? ` (${st.engine === 'antigravity' ? 'Antigravity CLI' : 'Claude Code'})` : ''} em {hostLabel(hostId)} — escolha a pasta
           {connecting && <Icon name="loading" class="spin" />}
         </>
       }
@@ -111,7 +117,7 @@ export function NewChatPicker() {
         const p = q.trim();
         if (!p) return;
         close();
-        newChat(hostId, p.startsWith('~') && home ? join(platformOf(hostId), home, p.slice(1).replace(/^[\\/]/, '')) : p).catch((e) => toast(errorText(e), 'error'));
+        newChat(hostId, p.startsWith('~') && home ? join(platformOf(hostId), home, p.slice(1).replace(/^[\\/]/, '')) : p, { engine: st.engine }).catch((e) => toast(errorText(e), 'error'));
       }}
       onPick={(it, q) => {
         close();
@@ -121,7 +127,7 @@ export function NewChatPicker() {
         }
         const folder = it.id.slice(2);
         void q;
-        newChat(hostId, folder).catch((e) => toast(errorText(e), 'error'));
+        newChat(hostId, folder, { engine: st.engine }).catch((e) => toast(errorText(e), 'error'));
       }}
     />
   );
@@ -176,8 +182,12 @@ export function CommandPalette() {
   const c = activeChat.value;
   const cmds: (QPItem & { run: () => void })[] = [
     { id: 'new', label: 'Nova conversa…', kb: 'Ctrl+Shift+N', icon: 'comment-discussion', run: () => (newChatPicker.value = {}) },
+    { id: 'new-claude', label: 'Nova conversa (Claude Code)…', icon: 'hubot', run: () => (newChatPicker.value = { engine: 'claude' }) },
+    { id: 'new-agy', label: 'Nova conversa (Antigravity CLI)…', icon: 'sparkle', run: () => (newChatPicker.value = { engine: 'antigravity' }) },
     ...(c ? [{ id: 'new-same', label: 'Nova conversa na mesma pasta', kb: 'Ctrl+N', icon: 'add', run: () => newChat(c.state.value.hostId, c.state.value.cwd) }] : []),
     ...(c ? [{ id: 'close', label: 'Fechar conversa atual', kb: 'Ctrl+Shift+W', icon: 'close', run: () => closeChat(c.sid) }] : []),
+    ...(c ? [{ id: 'pin', label: isChatPinned(c.sid) ? 'Desafixar a aba da conversa atual' : 'Fixar a aba da conversa atual (sempre no começo)', icon: isChatPinned(c.sid) ? 'pinned' : 'pin', run: () => toggleChatPinned(c.sid) }] : []),
+    ...(orqSupported.value ? [{ id: 'orq-new', label: 'Novo orquestrador (dividir uma tarefa grande em várias conversas)…', icon: 'organization', run: () => openNewOrchestrator() }] : []),
     { id: 'sort-tabs', label: 'Organizar abas agora (terminou › pede resposta › trabalhando › paradas)', kb: 'Ctrl+Alt+O', icon: 'sort-precedence', run: sortChatsNow },
     { id: 'open-file', label: 'Abrir arquivo…', kb: 'Ctrl+P', icon: 'go-to-file', run: () => (quickOpen.value = true) },
     { id: 'open-folder', label: 'Abrir pasta…', icon: 'folder-opened', run: () => (folderBrowser.value = { hostId: windowHostId(), purpose: 'workspace' }) },
@@ -215,6 +225,8 @@ export function CommandPalette() {
     { id: 'zoom-in', label: 'Aumentar fonte do chat', icon: 'zoom-in', run: () => updateSettings({ chatFontSize: Math.min(24, settings.value.chatFontSize + 1) }) },
     { id: 'zoom-out', label: 'Diminuir fonte do chat', icon: 'zoom-out', run: () => updateSettings({ chatFontSize: Math.max(10, settings.value.chatFontSize - 1) }) },
     { id: 'settings', label: 'Configurações', kb: 'Ctrl+,', icon: 'settings-gear', run: () => ((sidebarView.value = 'settings'), (sidebarVisible.value = true)) },
+    { id: 'claude-settings', label: 'Claude Code: Configurações visuais (settings.json)…', icon: 'settings-gear', run: () => openClaudeSettingsModal() },
+    { id: 'claude-settings-file', label: 'Claude Code: Abrir settings.json no editor', icon: 'code', run: () => openClaudeSettingsFile() },
     ...chats.value.map((x) => ({ id: `go:${x.sid}`, label: `Ir para: ${chatTitle(x)}`, desc: `${hostLabel(x.state.value.hostId)} · ${x.state.value.cwd}`, icon: 'comment', run: () => activateChat(x.sid) })),
   ];
   return (

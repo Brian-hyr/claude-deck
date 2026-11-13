@@ -11,12 +11,19 @@ import { LocalTransport, RemoteTransport, type Transport, type EndReason } from 
 import { shq } from '../fs/hostfs';
 import { DeckError, isSyntheticBreadcrumb } from '../../shared/protocol';
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, TerminalMcpServer, type ToolResult } from '../terminal/mcp';
+import { ORQ_IDEMPOTENT, ORQ_SERVER_NAME, ORQ_TOOL_PREFIX, OrqMcpServer, type OrqToolSpec } from '../orq/mcp';
 import { describeResult, type TerminalAgent } from '../terminal/agent';
+import { isAutoModel, toAutoPick, type AutoDecision } from '../../shared/automodel';
+import { normalizeAntigravityEvent } from './antigravityAdapter';
 import {
   LOCAL_HOST_ID,
+  type AgentEngine,
+  type AutoModelPick,
   type PermissionMode,
   type EffortLevel,
+  type ModelOption,
   type SessionCapabilities,
+  type SessionOrqRole,
   type SessionPhase,
   type SessionState,
 } from '../../shared/types';
@@ -25,8 +32,33 @@ const MODES: PermissionMode[] = ['default', 'acceptEdits', 'plan', 'auto', 'bypa
 const EFFORT_LEVELS: EffortLevel[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 const SAFE_TOKEN = /^[A-Za-z0-9._:\[\]\/@-]+$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** Leituras sem achar a escolha do gateway por pedido do usuário (o hook pode levar até ~15 s para decidir). */
+const AUTO_PICK_MAX_MISSES = 5;
+/** Prazo para o CLI pegar a próxima mensagem da fila depois de um `result` (ver `hasQueuedInput`). */
+const QUEUE_GRACE_MS = 15_000;
 
-export function buildArgs(o: { resume?: string; mode: PermissionMode; model?: string; effort?: EffortLevel }): string[] {
+/**
+ * "Aprovar sozinho" libera pedidos de permissão de ferramenta. Perguntas ao usuário e aprovação de
+ * plano não são permissões: precisam de uma resposta de verdade, então continuam esperando.
+ */
+export function autoApprovable(msg: any): boolean {
+  const tn = msg?.request?.tool_name;
+  return msg?.request?.subtype === 'can_use_tool' && tn !== 'AskUserQuestion' && tn !== 'ExitPlanMode';
+}
+
+export function buildArgs(o: { engine?: AgentEngine; resume?: string; mode: PermissionMode; model?: string; effort?: EffortLevel }): string[] {
+  if (o.engine === 'antigravity') {
+    const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json'];
+    if (o.model) {
+      if (!SAFE_TOKEN.test(o.model)) throw new DeckError('bad', 'Nome de modelo inválido.');
+      args.push('--model', o.model);
+    }
+    if (o.resume) {
+      if (!SAFE_TOKEN.test(o.resume)) throw new DeckError('bad', 'Id de conversa inválido.');
+      args.push('--conversation', o.resume);
+    }
+    return args;
+  }
   const args = [
     '-p',
     '--input-format',
@@ -61,15 +93,19 @@ export interface SessionRecord {
   sid: string;
   hostId: string;
   cwd: string;
+  engine?: AgentEngine;
   sessionId?: string;
   runnerId?: string;
   offset?: number;
   /** Byte logo após o último "result" (começo do turno atual) no arquivo de saída do runner. */
   turnOffset?: number;
   model?: string;
+  /** Escolha do gateway no modo automático (só para mostrar; o CLI segue com `model`). */
+  autoPick?: AutoModelPick;
   effort?: EffortLevel;
   permissionMode?: PermissionMode;
   executionMode?: 'silent' | 'terminal';
+  autoApprove?: boolean;
   /** Réplicas do runner não podem executar novamente uma ferramenta do terminal. */
   terminalCalls?: Record<string, { fingerprint: string; response?: any }>;
   title?: string;
@@ -93,6 +129,15 @@ export interface SessionRecord {
   processStartedAt?: number;
   /** Último começo/fim de turno (ver SessionState.lastActivityAt): sobrevive ao reinício do app. */
   lastActivityAt?: number;
+  /** Papel numa orquestração (orquestrador ou worker): define se o servidor MCP deck_orq é registrado. */
+  orq?: SessionOrqRole;
+}
+
+function validOrqRole(r: any): SessionOrqRole | undefined {
+  if (!r || typeof r !== 'object' || typeof r.id !== 'string' || !r.id) return undefined;
+  if (r.role === 'orchestrator') return { id: r.id, role: 'orchestrator' };
+  if (r.role === 'worker' && typeof r.workerId === 'string' && typeof r.taskId === 'string') return { id: r.id, role: 'worker', taskId: r.taskId, workerId: r.workerId };
+  return undefined;
 }
 
 /**
@@ -103,6 +148,22 @@ export interface SessionRecord {
 function unseenDelayMs(): number {
   const n = Number(process.env.CLAUDE_DECK_UNSEEN_DELAY_MS);
   return Number.isFinite(n) && n >= 0 && process.env.CLAUDE_DECK_UNSEEN_DELAY_MS !== '' ? n : 3500;
+}
+
+/** Código de saída de um processo morto com SIGKILL (128 + 9): monitor do servidor, OOM killer, `kill -9`. */
+const KILLED_EXIT_CODE = 137;
+/** Quedas separadas por mais que isso não contam como "em sequência" para o limite de retomadas automáticas. */
+const AUTO_RESUME_WINDOW_MS = 5 * 60_000;
+
+/**
+ * Espera antes de retomar sozinho, crescendo a cada queda seguida (5 s, 10 s, 20 s... até 60 s): dá tempo ao servidor
+ * de respirar se o que matou o processo foi falta de memória, e não martela um monitor que mata sempre.
+ * `CLAUDE_DECK_AUTORESUME_DELAY_MS` existe só para os testes (vira o atraso fixo).
+ */
+function autoResumeDelayMs(consecutive: number): number {
+  const fixed = process.env.CLAUDE_DECK_AUTORESUME_DELAY_MS;
+  if (fixed !== undefined && fixed !== '' && Number.isFinite(Number(fixed)) && Number(fixed) >= 0) return Number(fixed);
+  return Math.min(5_000 * 2 ** Math.max(0, consecutive - 1), 60_000);
 }
 
 export interface BufferedMsg {
@@ -146,16 +207,42 @@ export class ClaudeSession extends EventEmitter {
   titleFromPrompt = false;
   /** Última busca do título no transcript (ms): limita a uma a cada 30 s quando ele ainda não existe. */
   titleTryAt = 0;
+  /** Busca da escolha do gateway (modo automático): uma leitura por vez, no máximo uma a cada 2 s. */
+  autoPickBusy = false;
+  autoPickTryAt = 0;
+  /** Leituras sem achar desde o último pedido do usuário (limita o custo quando o servidor não tem o hook). */
+  autoPickMisses = 0;
+  /** Até onde o transcript já foi procurado sem achar o aviso do hook (a próxima busca só lê o que veio depois). */
+  autoPickScanned = 0;
   private answered: string[] = [];
   /** Quando cada mensagem do usuário foi enviada (uuid → ms): data/hora no eco de CLIs que não mandam `timestamp`. */
   private sentAt = new Map<string, number>();
+  /**
+   * Mensagens já escritas para o CLI que ele ainda não começou a processar (sem eco `isReplay`). Entre o fim de um
+   * turno e o começo do próximo da fila, a fase passa por "idle": quem decide "está parado?" (o orquestrador) olha isto.
+   */
+  private unechoed = new Set<string>();
+  /** Quando o último turno terminou (`result`), para o prazo de `hasQueuedInput`. */
+  private turnEndedAt = 0;
   runnerEnded = false;
   private sawIdleKill = false;
   private unseenTimer: NodeJS.Timeout | null = null;
+  /** Retomada automática agendada depois de o processo ser morto à força (ver `scheduleAutoResume`). */
+  private autoResumeTimer: NodeJS.Timeout | null = null;
+  /** Retomadas automáticas seguidas (zera quando um turno termina ou a última foi há mais de 5 min). */
+  private autoResumeCount = 0;
+  private lastAutoResumeAt = 0;
   /** Um turno está em andamento (eco da mensagem do usuário recebido e ainda sem "result"). */
   private inTurn = false;
   /** Ferramentas do terminal ao vivo (servidor MCP hospedado pelo app, pelo canal da conversa). */
   private termMcp = new TerminalMcpServer({ call: (tool, args, signal) => this.callTerminalTool(tool, args, signal) });
+  /** Ferramentas da orquestração (só conversas com papel numa orquestração recebem este servidor). */
+  private orqMcp = new OrqMcpServer({
+    tools: () => this.mgr.orq?.toolsFor(this) ?? [],
+    instructions: () => this.mgr.orq?.instructionsFor(this) ?? '',
+    call: (tool, args, signal) =>
+      this.mgr.orq ? this.mgr.orq.call(this, tool, args, signal) : Promise.resolve({ content: [{ type: 'text', text: 'Orquestração indisponível neste servidor do Claude Deck.' }], isError: true }),
+  });
   /** O último modo avisado ao Claude (o aviso vai junto da próxima mensagem quando muda). */
   private announcedMode: 'silent' | 'terminal' | null = null;
 
@@ -168,12 +255,15 @@ export class ClaudeSession extends EventEmitter {
       sid: rec.sid,
       hostId: rec.hostId,
       cwd: rec.cwd,
+      engine: rec.engine ?? 'claude',
       sessionId: rec.sessionId,
       title: rec.title,
       phase: 'dormant',
       permissionMode: rec.permissionMode,
       executionMode: rec.executionMode === 'terminal' ? 'terminal' : 'silent',
+      autoApprove: rec.autoApprove === true ? true : undefined,
       model: rec.model,
+      autoPick: rec.autoPick && typeof rec.autoPick.model === 'string' && rec.autoPick.model ? rec.autoPick : undefined,
       effort: EFFORT_LEVELS.includes(rec.effort as EffortLevel) ? rec.effort : undefined,
       runnerId: rec.runnerId,
       createdAt: rec.createdAt,
@@ -184,6 +274,7 @@ export class ClaudeSession extends EventEmitter {
       turnStartedAt: typeof rec.turnStartedAt === 'number' && rec.turnStartedAt > 0 ? rec.turnStartedAt : undefined,
       processStartedAt: typeof rec.processStartedAt === 'number' && rec.processStartedAt > 0 ? rec.processStartedAt : undefined,
       lastActivityAt: typeof rec.lastActivityAt === 'number' && rec.lastActivityAt > 0 ? rec.lastActivityAt : undefined,
+      orq: validOrqRole(rec.orq),
     };
     // Depois de o app reiniciar, a interface recarrega a conversa do zero: reanexa a partir do
     // começo do turno atual (o que veio antes já está no transcript) para não perder o que
@@ -208,14 +299,17 @@ export class ClaudeSession extends EventEmitter {
       sid: this.state.sid,
       hostId: this.state.hostId,
       cwd: this.state.cwd,
+      engine: this.state.engine,
       sessionId: this.state.sessionId,
       runnerId: this.state.runnerId,
       offset: this.offset,
       turnOffset: this.turnOffset,
       model: this.requestedModel,
+      autoPick: this.state.autoPick,
       effort: this.state.effort,
       permissionMode: this.state.permissionMode,
       executionMode: this.state.executionMode === 'terminal' ? 'terminal' : undefined,
+      autoApprove: this.state.autoApprove || undefined,
       terminalCalls: this.terminalCalls.size ? Object.fromEntries(this.terminalCalls) : undefined,
       title: this.state.title,
       userTitle: this.userTitle,
@@ -229,6 +323,7 @@ export class ClaudeSession extends EventEmitter {
       turnStartedAt: this.state.turnStartedAt,
       processStartedAt: this.state.processStartedAt,
       lastActivityAt: this.state.lastActivityAt,
+      orq: this.state.orq,
     };
   }
 
@@ -237,13 +332,28 @@ export class ClaudeSession extends EventEmitter {
     this.setState({ wid });
   }
 
-  /** Initialize do CLI: registra as ferramentas do terminal ao vivo (servidor MCP do app). */
+  setEngine(engine: AgentEngine) {
+    if ((this.state.engine ?? 'claude') === engine) return;
+    if (this.transport?.alive || this.starting || this.state.sessionId || this.state.runnerId)
+      throw new DeckError('busy', 'Esta conversa já iniciou em outro motor. Abra uma nova conversa com o motor desejado.');
+    // Não carregue um alias de modelo do motor anterior para o novo motor.
+    this.requestedModel = undefined;
+    this.setState({ engine, model: undefined, autoPick: undefined });
+    this.mgr.persistSoon();
+  }
+
+  /**
+   * Initialize do CLI: registra as ferramentas do terminal ao vivo (servidor MCP do app) e, nas conversas de uma
+   * orquestração, as da orquestração.
+   */
   private initRequest() {
+    const servers = this.state.orq ? [MCP_SERVER_NAME, ORQ_SERVER_NAME] : [MCP_SERVER_NAME];
     return {
       subtype: 'initialize',
-      sdkMcpServers: [MCP_SERVER_NAME],
-      // Comandos de rede podem demorar (backup, ping longo): a ferramenta tem o próprio limite.
-      sdkMcpServerConfigs: { [MCP_SERVER_NAME]: { timeout: 31 * 60_000 } },
+      sdkMcpServers: servers,
+      // Comandos de rede podem demorar (backup, ping longo) e worker_wait espera até 30 min: cada ferramenta tem o
+      // próprio limite.
+      sdkMcpServerConfigs: Object.fromEntries(servers.map((n) => [n, { timeout: 31 * 60_000 }])),
     };
   }
 
@@ -343,14 +453,17 @@ export class ClaudeSession extends EventEmitter {
     const carriedTurnStart = this.state.turnStartedAt;
     this.setPhase('starting');
     const mode = modeOverride ?? this.state.permissionMode ?? store.settings.defaultPermissionMode;
-    const model = this.requestedModel || store.settings.defaultModel || undefined;
-    const args = buildArgs({ resume: this.state.sessionId, mode, model, effort: this.state.effort });
+    const isAgy = this.state.engine === 'antigravity';
+    // O padrão global pode ser um alias de gateway que não existe no Antigravity.
+    const model = isAgy ? this.requestedModel : (this.requestedModel || store.settings.defaultModel || undefined);
+    const args = buildArgs({ engine: this.state.engine, resume: this.state.sessionId, mode, model, effort: this.state.effort });
     this.gotInitialize = false;
     this.startedAt = this.state.processStartedAt ?? Date.now();
     this.setState({ processStartedAt: this.startedAt });
     try {
       const status = await registry.connect(this.state.hostId);
-      if (!status.claude) {
+      const bin = isAgy ? (status.agy?.path || 'agy') : status.claude?.path;
+      if (!isAgy && !status.claude) {
         throw new DeckError(
           'noclaude',
           this.isRemote
@@ -358,20 +471,32 @@ export class ClaudeSession extends EventEmitter {
             : 'Claude Code não encontrado neste computador. Instale pelo site oficial ou configure o caminho nas Configurações.',
         );
       }
-      this.setState({ claudeVersion: status.claude.version });
+      if (isAgy && !status.agy) {
+        throw new DeckError(
+          'noagy',
+          this.isRemote
+            ? `Antigravity CLI não encontrado em ${this.state.hostId}. Clique em "Instalar Antigravity CLI" para instalar automaticamente.`
+            : 'Antigravity CLI não encontrado neste computador. Clique em "Instalar Antigravity CLI" para instalar automaticamente.',
+        );
+      }
+      this.setState({ claudeVersion: isAgy ? (status.agy?.version || '1.0.0 (agy)') : status.claude!.version });
       if (!this.isRemote) {
         if (!fs.existsSync(this.state.cwd)) throw new DeckError('nocwd', `A pasta não existe: ${this.state.cwd}`);
         const env = { ...process.env, CLAUDE_CODE_ENTRYPOINT: 'cli' };
         delete (env as any).NODE_OPTIONS;
         this.terminalCalls.clear(); // processo novo: IDs do anterior não podem colidir
-        this.attachTransport(new LocalTransport(status.claude.path, args, this.state.cwd, env));
+        this.attachTransport(new LocalTransport(bin!, args, this.state.cwd, env));
       } else {
         const runnerId = this.state.runnerId ?? this.state.sid;
         if (!this.state.runnerId) this.setState({ runnerId });
         await registry.ensureRunner(this.state.hostId);
         const ssh = registry.get(this.state.hostId).ssh!;
-        const override = store.settings.hostClaudePath[this.state.hostId];
-        const binArg = override ? Buffer.from(override).toString('base64') : 'auto';
+        const override = isAgy ? store.settings.hostAgyPath?.[this.state.hostId] : store.settings.hostClaudePath[this.state.hostId];
+        const binArg = override
+          ? Buffer.from(override).toString('base64')
+          : (isAgy
+              ? (status.agy?.path ? Buffer.from(status.agy.path).toString('base64') : 'auto_agy')
+              : (status.claude?.path ? Buffer.from(status.claude.path).toString('base64') : 'auto'));
         const idle = Math.max(1, Math.round((store.settings.remoteIdleHours || 6) * 3600));
         const cmd =
           `exec "\${SHELL:-/bin/sh}" -lc ${shq(
@@ -385,12 +510,12 @@ export class ClaudeSession extends EventEmitter {
           let init: any;
           try {
             await this.attachRemote();
-            init = await this.control(this.initRequest(), 45_000);
+            init = isAgy ? null : await this.control(this.initRequest(), 45_000);
           } finally {
             this.awaitingInit = false;
           }
           this.gotInitialize = true;
-          this.applyInitialize(init);
+          if (init) this.applyInitialize(init);
           const mid = this.inTurn || this.pendingPermissions.size > 0;
           if (mid && carriedTurnStart) this.state = { ...this.state, turnStartedAt: carriedTurnStart };
           this.setPhase(mid ? 'running' : 'idle');
@@ -401,10 +526,12 @@ export class ClaudeSession extends EventEmitter {
           const code = last.split(' ')[1] ?? '';
           const msg =
             code === 'noclaude'
-              ? `Claude Code não encontrado em ${this.state.hostId}. Instale com: curl -fsSL https://claude.ai/install.sh | bash`
-              : code === 'nocwd'
-                ? `A pasta não existe em ${this.state.hostId}: ${this.state.cwd}`
-                : `Falha ao iniciar o Claude em ${this.state.hostId}: ${last || r.stderr.trim() || 'sem resposta'}`;
+              ? `Claude Code não encontrado em ${this.state.hostId}.`
+              : code === 'noagy'
+                ? `Antigravity CLI não encontrado em ${this.state.hostId}. Clique em "Instalar Antigravity CLI" para instalar automaticamente.`
+                : code === 'nocwd'
+                  ? `A pasta não existe em ${this.state.hostId}: ${this.state.cwd}`
+                  : `Falha ao iniciar o ${isAgy ? 'Antigravity' : 'Claude'} em ${this.state.hostId}: ${last || r.stderr.trim() || 'sem resposta'}`;
           throw new DeckError(code || 'start', msg);
         }
         const size = Number(last.split(' ')[2]);
@@ -417,11 +544,17 @@ export class ClaudeSession extends EventEmitter {
       }
       // Processo novo: respostas de permissão guardadas eram do processo anterior.
       this.outbox = this.outbox.filter((l) => !l.startsWith('{"type":"control_response"'));
-      const init = await this.control(this.initRequest(), 45_000);
-      this.gotInitialize = true;
-      this.applyInitialize(init);
-      this.setPhase('idle');
-      this.flushOutbox();
+      if (isAgy) {
+        this.gotInitialize = true;
+        this.setPhase('idle');
+        this.flushOutbox();
+      } else {
+        const init = await this.control(this.initRequest(), 45_000);
+        this.gotInitialize = true;
+        this.applyInitialize(init);
+        this.setPhase('idle');
+        this.flushOutbox();
+      }
     } catch (e) {
       const err = e as Error;
       // Modo "auto" (ou modelo) não suportado por um CLI antigo: tenta de novo no modo padrão.
@@ -465,7 +598,7 @@ export class ClaudeSession extends EventEmitter {
   private onEnd(info: { reason: EndReason; code?: number | null; stderr?: string }) {
     for (const [id, c] of this.controls) {
       clearTimeout(c.timer);
-      c.reject(new Error('O processo do Claude encerrou.'));
+      c.reject(new Error(`O processo ${this.state.engine === 'antigravity' ? 'do Antigravity' : 'do Claude'} encerrou.`));
       this.controls.delete(id);
     }
     if (this.detaching) return;
@@ -479,6 +612,8 @@ export class ClaudeSession extends EventEmitter {
       return;
     }
     // O processo terminou: a conversa fica "adormecida" e retoma com --resume na próxima mensagem.
+    // Antes de zerar: caiu no meio de uma tarefa (ou esperando uma permissão) ou estava parado entre tarefas?
+    const wasWorking = this.inTurn || this.pendingPermissions.size > 0 || this.state.phase === 'running';
     this.pendingPermissions.clear();
     this.answered = [];
     this.inTurn = false;
@@ -494,11 +629,55 @@ export class ClaudeSession extends EventEmitter {
         return;
       }
     }
+    // Processo acabou: o que não teve eco não vai mais ter (ao reiniciar, o que estava na fila sai de novo pelo outbox).
+    this.unechoed.clear();
     const quick = Date.now() - this.startedAt < 15_000 && !this.gotInitialize;
     const failed = info.reason !== 'killed' && info.code !== 0 && info.code !== 143 && info.code != null;
     const err = failed || quick ? this.describeExit(info) : undefined;
     this.push({ type: 'deck_event', event: 'process_ended', code: info.code ?? null, reason: info.reason, error: err ?? null });
     this.setPhase('dormant', err);
+    if (wasWorking && info.reason === 'exit' && info.code === KILLED_EXIT_CODE) this.scheduleAutoResume();
+  }
+
+  /**
+   * O processo foi morto à força no meio de uma tarefa (código 137): manda uma mensagem curta ("continue") para o
+   * Claude seguir de onde parou, pelo mesmo caminho de quando o usuário escreve (`send` → `--resume`). Só age se a
+   * opção está ligada, e desiste depois de `autoResumeMax` quedas seguidas para não gastar créditos em laço.
+   */
+  private scheduleAutoResume() {
+    const settings = this.mgr.store.settings;
+    if (!settings.autoResumeOnKill || this.closing || this.detaching || this.autoResumeTimer) return;
+    // Mensagem do usuário já na fila: o próximo `start()` a entrega, não há o que acrescentar.
+    if (this.outbox.some((l) => l.startsWith('{"type":"user"'))) return;
+    const now = Date.now();
+    if (now - this.lastAutoResumeAt > AUTO_RESUME_WINDOW_MS) this.autoResumeCount = 0;
+    const max = Math.max(1, Math.min(20, Math.round(Number(settings.autoResumeMax)) || 5));
+    if (this.autoResumeCount >= max) {
+      this.push({ type: 'deck_event', event: 'auto_resume_gave_up', attempts: this.autoResumeCount });
+      this.autoResumeCount = 0; // a próxima mensagem do usuário recomeça a contagem do zero
+      return;
+    }
+    const attempt = ++this.autoResumeCount;
+    const delay = autoResumeDelayMs(attempt);
+    this.lastAutoResumeAt = now;
+    this.push({ type: 'deck_event', event: 'auto_resume', attempt, max, delayMs: delay });
+    this.autoResumeTimer = setTimeout(() => {
+      this.autoResumeTimer = null;
+      // Enquanto esperava: fechou a aba, o usuário já escreveu/retomou, parou a tarefa ou o processo voltou.
+      if (this.closing || this.detaching || this.starting || this.transport?.alive || this.state.phase !== 'dormant') return;
+      const cur = this.mgr.store.settings; // relê: pode ter sido desligado ou editado durante a espera
+      if (!cur.autoResumeOnKill) return;
+      const text = String(cur.autoResumeMessage ?? '').trim().slice(0, 2000) || 'continue';
+      this.send([{ type: 'text', text }], crypto.randomUUID()).catch((e) => {
+        this.mgr.log(`[${this.state.hostId}] retomada automática de ${this.state.sid.slice(0, 8)} falhou: ${(e as Error).message}`);
+      });
+    }, delay);
+    this.autoResumeTimer.unref?.();
+  }
+
+  private cancelAutoResume() {
+    if (this.autoResumeTimer) clearTimeout(this.autoResumeTimer);
+    this.autoResumeTimer = null;
   }
 
   private describeExit(info: { code?: number | null; stderr?: string }): string {
@@ -507,7 +686,7 @@ export class ClaudeSession extends EventEmitter {
       .filter((l) => l.trim() && !/connectors are disabled/i.test(l))
       .slice(-4)
       .join(' | ');
-    return `O Claude encerrou (código ${info.code ?? '?'})${tail ? ': ' + tail : ''}`;
+    return `O ${this.state.engine === 'antigravity' ? 'Antigravity' : 'Claude'} encerrou (código ${info.code ?? '?'})${tail ? ': ' + tail : ''}`;
   }
 
   private scheduleReattach() {
@@ -598,6 +777,16 @@ export class ClaudeSession extends EventEmitter {
         : undefined,
     };
     this.mgr.setCaps(this.state.hostId, caps);
+    // Completa com os modelos do settings.json que o CLI não listou (sem bloquear a inicialização).
+    const hostId = this.state.hostId;
+    this.mgr
+      .pickerReader(hostId)
+      .then((extra) => {
+        const have = new Set(caps.models.map((m) => m.value));
+        const missing = extra.filter((m) => !have.has(m.value));
+        if (missing.length) this.mgr.setCaps(hostId, { ...caps, models: [...caps.models, ...missing] });
+      })
+      .catch((e) => this.mgr.log(`modelPicker do settings.json: ${(e as Error).message}`));
     if (resp?.current_permission_mode) this.setState({ permissionMode: resp.current_permission_mode });
     // Pedidos de permissão que ficaram pendentes enquanto a interface estava desconectada.
     for (const pr of resp?.pending_permission_requests ?? []) {
@@ -613,12 +802,21 @@ export class ClaudeSession extends EventEmitter {
 
   private onLine(line: string, bytes: number) {
     this.offset += bytes;
-    let msg: any;
+    let rawMsg: any;
     try {
-      msg = JSON.parse(line);
+      rawMsg = JSON.parse(line);
     } catch {
       return;
     }
+    const msgs = this.state.engine === 'antigravity'
+      ? normalizeAntigravityEvent(rawMsg, this.state.sessionId)
+      : [rawMsg];
+    for (const msg of msgs) {
+      this.processSingleMsg(msg);
+    }
+  }
+
+  private processSingleMsg(msg: any) {
     // Ecos e breadcrumbs sintéticos do CLI (ex.: ao trocar modelo via set_model):
     // não representam mensagens reais do usuário nem iniciam turnos de trabalho.
     if (isSyntheticBreadcrumb(msg)) return;
@@ -656,7 +854,10 @@ export class ClaudeSession extends EventEmitter {
             response: { behavior: 'deny', message: `Terminal ao Vivo está ativo. Use ${MCP_TOOL_PREFIX}run no terminal vinculado, não execução invisível.` } } });
           return;
         }
-        if (tn === `${MCP_TOOL_PREFIX}read` || tn === `${MCP_TOOL_PREFIX}wait`) {
+        // Ferramentas da orquestração mexem só no quadro do Deck e criam conversas cujas permissões continuam valendo
+        // (o usuário escolheu o modo dos workers ao criar a orquestração): liberadas sem perguntar.
+        const orqTool = !!this.state.orq && typeof tn === 'string' && tn.startsWith(ORQ_TOOL_PREFIX);
+        if (tn === `${MCP_TOOL_PREFIX}read` || tn === `${MCP_TOOL_PREFIX}wait` || orqTool) {
           this.answered.push(msg.request_id);
           if (this.answered.length > 50) this.answered.shift();
           this.writeControlResponse({
@@ -667,6 +868,10 @@ export class ClaudeSession extends EventEmitter {
         }
         this.pendingPermissions.set(msg.request_id, msg);
         this.push(msg);
+        if (this.state.autoApprove && autoApprovable(msg)) {
+          this.autoAllow(msg);
+          return;
+        }
         this.emit('attention', { kind: 'permission', tool: msg.request?.tool_name });
         return;
       }
@@ -684,8 +889,8 @@ export class ClaudeSession extends EventEmitter {
       return;
     }
     if (msg.type === 'control_cancel_request') {
-      const mcpId = this.mcpRequestIds.get(msg.request_id);
-      if (mcpId !== undefined) this.termMcp.cancel(mcpId);
+      const pending = this.mcpRequestIds.get(msg.request_id);
+      if (pending) pending.server.cancel(pending.id);
       this.pendingPermissions.delete(msg.request_id);
       this.push(msg);
       return;
@@ -694,18 +899,28 @@ export class ClaudeSession extends EventEmitter {
     if (msg.type === 'system' && msg.subtype === 'init') {
       const patch: Partial<SessionState> = { model: msg.model, permissionMode: msg.permissionMode, claudeVersion: msg.claude_code_version };
       if (msg.session_id && msg.session_id !== this.state.sessionId) patch.sessionId = msg.session_id;
+      // O CLI repete o "init" a cada pedido, sempre com o modelo automático: a escolha do gateway (guardada à
+      // parte) continua valendo. Só some se a conversa mudou ou saiu do modo automático.
+      if (this.state.autoPick && (patch.sessionId || !isAutoModel(msg.model))) patch.autoPick = undefined;
+      if (patch.sessionId) this.autoPickScanned = 0;
       this.setState(patch);
+      this.mgr.scheduleAutoPick(this);
     } else if (msg.type === 'system' && msg.subtype === 'status' && msg.permissionMode) {
       this.setState({ permissionMode: msg.permissionMode });
     } else if (msg.type === 'user' && msg.isReplay) {
+      if (msg.uuid) this.unechoed.delete(msg.uuid);
       if (!msg.timestamp && msg.uuid && this.sentAt.has(msg.uuid)) msg.timestamp = new Date(this.sentAt.get(msg.uuid)!).toISOString();
       this.inTurn = true;
       if (this.state.phase !== 'running') this.setPhase('running');
     } else if (msg.type === 'stream_event' || msg.type === 'assistant') {
       if (this.state.phase === 'idle') this.setPhase('running');
+      // A 1ª resposta do modelo só sai depois de o hook decidir: o arquivo dele já deve existir.
+      if (msg.type === 'assistant' && !msg.parent_tool_use_id) this.mgr.scheduleAutoPick(this);
     } else if (msg.type === 'result') {
       if (!msg.timestamp) msg.timestamp = new Date().toISOString();
+      this.turnEndedAt = Date.now();
       this.resultsSeen++;
+      this.autoResumeCount = 0; // um turno terminou de verdade: as quedas anteriores não contam mais
       this.turnOffset = this.offset;
       // IDs e offset são salvos na mesma escrita atômica. Turnos concluídos não são relidos.
       this.terminalCalls.clear();
@@ -716,6 +931,7 @@ export class ClaudeSession extends EventEmitter {
       this.emit('attention', { kind: 'done', error: msg.is_error, subtype: msg.subtype });
       this.flagUnseenSoon(msg.is_error ? 'error' : 'done');
       if (this.resultsSeen <= 3 || !this.state.title || this.titleFromPrompt || (this.userTitle && !this.userTitleWritten)) this.mgr.scheduleTitleRefresh(this);
+      this.mgr.scheduleAutoPick(this);
       // Remoto: grava o novo começo de turno na hora. Se o app cair logo depois do fim do turno,
       // ao reanexar ele não relê o turno anterior (o "result" antigo apareceria fora do lugar).
       if (this.isRemote) this.mgr.persistNow();
@@ -731,7 +947,7 @@ export class ClaudeSession extends EventEmitter {
   /** Registro durável antes de digitar: uma queda entre envio e resultado nunca causa retry cego. */
   private terminalCalls = new Map<string, { fingerprint: string; response?: any }>();
   private mcpTasks = new Map<string, Promise<any>>();
-  private mcpRequestIds = new Map<string, string | number>();
+  private mcpRequestIds = new Map<string, { server: { cancel(id: string | number): void }; id: string | number }>();
 
   private onMcpMessage(msg: any) {
     const reqId = msg.request_id;
@@ -742,12 +958,25 @@ export class ClaudeSession extends EventEmitter {
     });
     const error = (message: string) => ({ jsonrpc: '2.0', id: payload?.id ?? 0,
       result: { isError: true, content: [{ type: 'text', text: message }] } });
-    if (msg.request?.server_name !== MCP_SERVER_NAME) {
+    const serverName = msg.request?.server_name;
+    const server = serverName === MCP_SERVER_NAME ? this.termMcp : serverName === ORQ_SERVER_NAME && this.state.orq ? this.orqMcp : null;
+    if (!server) {
       answer(error('Servidor MCP desconhecido.'));
       return;
     }
     if (payload?.method !== 'tools/call' || payload.id == null) {
-      this.termMcp.handle(payload).then((r) => answer(r ?? { jsonrpc: '2.0', result: {}, id: 0 })).catch((e) => answer(error(String(e))));
+      server.handle(payload).then((r) => answer(r ?? { jsonrpc: '2.0', result: {}, id: 0 })).catch((e) => answer(error(String(e))));
+      return;
+    }
+    // Consultas e esperas da orquestração podem rodar de novo depois de uma queda sem efeito colateral: não passam pelo
+    // registro durável (uma espera pendente relida ao reanexar volta a esperar, em vez de virar "resultado incerto").
+    if (server === this.orqMcp && ORQ_IDEMPOTENT.has(String(payload.params?.name ?? ''))) {
+      this.mcpRequestIds.set(reqId, { server, id: payload.id });
+      void server
+        .handle(payload)
+        .catch((e) => error(String(e)))
+        .then(answer)
+        .finally(() => this.mcpRequestIds.delete(reqId));
       return;
     }
     const fingerprint = crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
@@ -756,7 +985,14 @@ export class ClaudeSession extends EventEmitter {
       if (old.fingerprint !== fingerprint) return answer(error('ID repetido com conteúdo diferente; nada foi executado.'));
       const pending = this.mcpTasks.get(reqId);
       if (pending) { void pending.then(answer); return; }
-      answer(old.response ?? error('O app perdeu a conexão durante esta chamada. Ela pode ter executado antes da queda e NÃO será repetida. Leia o terminal e confirme o estado com o usuário antes de qualquer novo comando.'));
+      answer(
+        old.response ??
+          error(
+            server === this.orqMcp
+              ? 'O app perdeu a conexão durante esta chamada. Ela pode ter executado antes da queda (ex.: worker criado ou mensagem enviada) e NÃO será repetida. Confira com tasks_list/worker_status antes de tentar de novo.'
+              : 'O app perdeu a conexão durante esta chamada. Ela pode ter executado antes da queda e NÃO será repetida. Leia o terminal e confirme o estado com o usuário antes de qualquer novo comando.',
+          ),
+      );
       return;
     }
     // Limite por turno: falhar fechado é preferível a descartar um ID que o runner pode repetir.
@@ -770,8 +1006,8 @@ export class ClaudeSession extends EventEmitter {
       answer(error('Não foi possível gravar a proteção contra repetição. Nenhum comando foi enviado.'));
       return;
     }
-    this.mcpRequestIds.set(reqId, payload.id);
-    const task = this.termMcp.handle(payload).catch((e) => error(String(e))).then((response) => {
+    this.mcpRequestIds.set(reqId, { server, id: payload.id });
+    const task = server.handle(payload).catch((e) => error(String(e))).then((response) => {
       entry.response = response;
       // O marcador anterior continua no disco se esta gravação falhar: nunca reexecutar.
       this.mgr.persistNow();
@@ -844,6 +1080,12 @@ export class ClaudeSession extends EventEmitter {
     this.setState({ executionMode: mode });
   }
 
+  /** Cancela as esperas das ferramentas do app (terminal ao vivo e orquestração). */
+  private abortMcp() {
+    this.termMcp.abortAll();
+    this.orqMcp.abortAll();
+  }
+
   /** Terminal ligado a esta conversa (pelo gerenciador). */
   setTerminal(id: string | undefined) {
     if (this.state.terminalId !== id) this.setState({ terminalId: id });
@@ -895,9 +1137,24 @@ export class ClaudeSession extends EventEmitter {
   }
 
   /** Mensagem do usuário (conteúdo no formato da API: blocos de texto e imagem). */
+  /**
+   * Há mensagem enviada esperando o CLI começar a processá-la (a conversa está entre dois turnos, não parada). O CLI
+   * pega a próxima da fila logo depois do `result`; se passar de QUEUE_GRACE_MS sem eco, a mensagem não vai sair
+   * (uuid repetido, descartada) e não pode deixar a conversa parecendo ocupada para sempre.
+   */
+  get hasQueuedInput(): boolean {
+    if (!this.unechoed.size) return false;
+    if (this.state.phase === 'idle' && Date.now() - this.turnEndedAt > QUEUE_GRACE_MS) {
+      this.unechoed.clear();
+      return false;
+    }
+    return true;
+  }
+
   async send(content: any[], uuid: string) {
     if (!Array.isArray(content) || !content.length) throw new DeckError('bad', 'Mensagem vazia.');
     if (!UUID_RE.test(uuid)) throw new DeckError('bad', 'uuid inválido');
+    this.cancelAutoResume(); // o usuário (ou a própria retomada, que já zerou o timer) está mandando algo: nada a agendar
     if (this.effortChange) await this.effortChange;
     if (!this.sentAt.has(uuid)) {
       this.sentAt.set(uuid, Date.now());
@@ -913,6 +1170,11 @@ export class ClaudeSession extends EventEmitter {
       uuid,
       origin: { kind: 'human' },
     });
+    // Modo automático sem escolha conhecida: o hook decide neste pedido (consulta ao gateway, até ~15 s).
+    this.autoPickMisses = 0;
+    this.mgr.scheduleAutoPick(this, [3_000, 10_000, 25_000]);
+    this.unechoed.add(uuid);
+    if (this.unechoed.size > 100) this.unechoed.delete(this.unechoed.values().next().value!);
     if (!this.transport?.alive && this.state.phase !== 'reconnecting') {
       this.outbox.push(line);
       await this.start();
@@ -938,8 +1200,9 @@ export class ClaudeSession extends EventEmitter {
   }
 
   async interrupt() {
-    // Parar também para de esperar o comando no terminal (o comando em si segue lá; o usuário vê).
-    this.termMcp.abortAll();
+    this.cancelAutoResume(); // "Parar" também vale para uma retomada automática ainda na espera
+    // Parar também para de esperar o comando no terminal (o comando em si segue lá; o usuário vê) e os workers.
+    this.abortMcp();
     // Parar logo depois de enviar, com o processo ainda iniciando/reanexando: a mensagem ainda está na
     // fila e nunca chegou ao Claude. Sai da fila (não roda depois, sozinha). Se um turno anterior está em
     // andamento (reanexando no meio dele), a da fila é a PRÓXIMA mensagem: fica, e o turno é que para.
@@ -956,6 +1219,20 @@ export class ClaudeSession extends EventEmitter {
     await this.control({ subtype: 'interrupt' }, 15_000);
   }
 
+  /** Liga/desliga "Aprovar sozinho". Ao ligar, libera também os pedidos que já estavam esperando. */
+  setAutoApprove(on: boolean) {
+    this.setState({ autoApprove: on || undefined });
+    if (!on) return;
+    for (const msg of [...this.pendingPermissions.values()]) if (autoApprovable(msg)) this.autoAllow(msg);
+  }
+
+  private autoAllow(msg: any) {
+    const response = { behavior: 'allow', updatedInput: msg.request?.input ?? {} };
+    this.respond(msg.request_id, response);
+    // Avisa as janelas que o pedido foi respondido (o cartão de permissão sai da tela).
+    this.push({ type: 'control_response', response: { subtype: 'success', request_id: msg.request_id, response, auto: true } });
+  }
+
   async setPermissionMode(mode: PermissionMode) {
     if (!MODES.includes(mode)) throw new DeckError('bad', 'Modo inválido.');
     if (this.transport?.alive && this.state.phase !== 'reconnecting') {
@@ -966,11 +1243,22 @@ export class ClaudeSession extends EventEmitter {
 
   async setModel(model: string | null) {
     if (model && !SAFE_TOKEN.test(model)) throw new DeckError('bad', 'Modelo inválido.');
+    if (this.state.engine === 'antigravity' && this.transport?.alive)
+      throw new DeckError('unsupported', 'A troca de modelo com o Antigravity em execução ainda não é suportada pelo Deck.');
     this.requestedModel = model ?? undefined;
     if (this.transport?.alive && this.state.phase !== 'reconnecting') {
       await this.control({ subtype: 'set_model', model: model ?? 'default' });
     }
-    this.setState({ model: model || undefined });
+    // Trocou de modelo: a escolha do gateway deixa de valer. Voltando ao automático, o gateway mantém a
+    // decisão desta conversa, e ela é lida de novo.
+    this.setState({ model: model || undefined, autoPick: undefined });
+    this.autoPickMisses = 0;
+    this.mgr.scheduleAutoPick(this);
+  }
+
+  /** Escolha do gateway para esta conversa no modo automático (só para mostrar; o CLI segue com `model`). */
+  setAutoPick(pick: AutoModelPick) {
+    this.setState({ autoPick: pick });
   }
 
   /** Processo de pé e já inicializado, sem reconectar nem reiniciar: dá para falar com o CLI agora. */
@@ -1094,7 +1382,8 @@ export class ClaudeSession extends EventEmitter {
   async close() {
     this.closing = true;
     this.cancelUnseenTimer();
-    this.termMcp.abortAll();
+    this.cancelAutoResume();
+    this.abortMcp();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.transport?.close();
@@ -1110,7 +1399,8 @@ export class ClaudeSession extends EventEmitter {
   detach() {
     this.detaching = true;
     this.cancelUnseenTimer();
-    this.termMcp.abortAll();
+    this.cancelAutoResume();
+    this.abortMcp();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.transport?.close();
@@ -1130,7 +1420,7 @@ export class ClaudeSession extends EventEmitter {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.reconnectAttempt = 0;
-    this.termMcp.abortAll();
+    this.abortMcp();
     for (const [id, c] of this.controls) {
       clearTimeout(c.timer);
       c.reject(new DeckError('parked', 'A conversa foi desconectada do servidor.'));
@@ -1169,10 +1459,22 @@ export interface TerminalBinder {
   reveal(id: string, s: ClaudeSession): void;
 }
 
+/** Liga as conversas às orquestrações (definido pelo servidor do Claude Deck). */
+export interface OrqBridge {
+  toolsFor(s: ClaudeSession): OrqToolSpec[];
+  instructionsFor(s: ClaudeSession): string;
+  call(s: ClaudeSession, tool: string, args: any, signal: AbortSignal): Promise<ToolResult>;
+  /** Conversa reaberta pelo Histórico que era orquestrador/worker: devolve o papel dela. */
+  roleForResume?(hostId: string, sessionId: string): SessionOrqRole | undefined;
+  /** A aba nova de uma conversa retomada passa a ser a do papel (sid novo). */
+  relink?(s: ClaudeSession): void;
+}
+
 export class SessionManager extends EventEmitter {
   sessions = new Map<string, ClaudeSession>();
   caps = new Map<string, SessionCapabilities>();
   terminals?: TerminalBinder;
+  orq?: OrqBridge;
   private persistTimer: NodeJS.Timeout | null = null;
 
   constructor(
@@ -1184,6 +1486,10 @@ export class SessionManager extends EventEmitter {
     public titleWriter: (s: ClaudeSession, title: string) => Promise<boolean> = async () => false,
     /** Nome provisório (começo do 1º pedido) para transcripts que ainda não têm nome do Claude nem do usuário. */
     public titleFallback: (s: ClaudeSession) => Promise<string | undefined> = async () => undefined,
+    /** Opções de `modelPicker.options` do settings.json do servidor (o CLI omite algumas, ex. classe Haiku). */
+    public pickerReader: (hostId: string) => Promise<ModelOption[]> = async () => [],
+    /** Escolha do gateway no modo automático: arquivo do hook ou o aviso dele no transcript (lido a partir de `from`). */
+    public autoPickReader: (s: ClaudeSession, from: number) => Promise<{ pick: AutoDecision | null; scannedTo?: number }> = async () => ({ pick: null }),
   ) {
     super();
     // Servidor que acabou de conectar: as conversas dele que estavam sem nome (abas restauradas) ganham o nome.
@@ -1246,6 +1552,7 @@ export class SessionManager extends EventEmitter {
   create(o: {
     hostId: string;
     cwd: string;
+    engine?: AgentEngine;
     resume?: string;
     permissionMode?: PermissionMode;
     executionMode?: 'silent' | 'terminal';
@@ -1253,25 +1560,38 @@ export class SessionManager extends EventEmitter {
     title?: string;
     start?: boolean;
     wid?: string;
+    /** Nível de esforço inicial (o processo já sobe com ele). */
+    effort?: EffortLevel;
+    /** Papel numa orquestração: precisa existir antes do processo iniciar (o "initialize" registra o servidor MCP). */
+    orq?: SessionOrqRole;
+    /** O título vale como nome dado pelo usuário (o automático do Claude não o troca). */
+    userTitle?: boolean;
   }) {
     const sid = crypto.randomUUID();
+    // Retomar pelo Histórico uma conversa que era orquestrador/worker: volta com o mesmo papel.
+    const orq = o.orq ?? (o.resume ? this.orq?.roleForResume?.(o.hostId, o.resume) : undefined);
     const s = this.add(
       new ClaudeSession(
         {
           sid,
           hostId: o.hostId,
           cwd: o.cwd,
+          engine: o.engine ?? this.store.settings.defaultEngine ?? 'claude',
           sessionId: o.resume,
           permissionMode: o.permissionMode ?? this.store.settings.defaultPermissionMode,
           executionMode: o.executionMode === 'terminal' ? 'terminal' : undefined,
           model: o.model,
+          effort: o.effort,
           title: o.title,
           createdAt: Date.now(),
           wid: o.wid,
+          orq,
         },
         this,
       ),
     );
+    if (o.userTitle && o.title) s.setTitle(o.title, true);
+    if (orq && !o.orq) this.orq?.relink?.(s);
     this.persistNow();
     if (o.start !== false) s.start().catch(() => {});
     this.ensureTitle(s); // retomada sem título (vinda de janela/restauração): já busca o nome no transcript
@@ -1337,10 +1657,48 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
+   * Modo automático: descobre o modelo que o gateway escolheu para a conversa (arquivo do hook ou, se ele já
+   * expirou, o aviso no transcript). Achou, guarda no estado e na gravação das sessões e não lê mais.
+   */
+  async resolveAutoPick(s: ClaudeSession) {
+    const sessionId = s.state.sessionId;
+    if (!isAutoModel(s.state.model) || s.state.autoPick || !sessionId || this.sessions.get(s.state.sid) !== s) return;
+    // Tarefa de fundo: não reabre a conexão de um servidor desconectado (volta a tentar quando ele conectar).
+    if (s.isRemote && this.registry.status(s.state.hostId).state !== 'ready') return;
+    if (s.autoPickBusy || s.autoPickMisses >= AUTO_PICK_MAX_MISSES || Date.now() - s.autoPickTryAt < 2_000) return;
+    s.autoPickBusy = true;
+    s.autoPickTryAt = Date.now();
+    try {
+      const { pick: found, scannedTo } = await this.autoPickReader(s, s.autoPickScanned);
+      if (typeof scannedTo === 'number' && s.state.sessionId === sessionId) s.autoPickScanned = scannedTo;
+      // A conversa pode ter trocado de modelo (ou de sessão) durante a leitura.
+      if (!found || !isAutoModel(s.state.model) || s.state.sessionId !== sessionId || s.state.autoPick) {
+        if (!found) s.autoPickMisses++;
+        return;
+      }
+      const pick = toAutoPick(found, this.caps.get(s.state.hostId)?.models ?? []);
+      s.setAutoPick(pick);
+      this.log(`modo automático da conversa ${sessionId.slice(0, 8)}: o gateway escolheu ${pick.model}${pick.effort ? ` (${pick.effort})` : ''}`);
+    } catch (e) {
+      s.autoPickMisses++;
+      this.log(`escolha do modo automático da conversa ${sessionId.slice(0, 8)}: ${(e as Error).message}`);
+    } finally {
+      s.autoPickBusy = false;
+    }
+  }
+
+  /** Agenda a busca da escolha do gateway (nada a fazer fora do modo automático ou com a escolha já conhecida). */
+  scheduleAutoPick(s: ClaudeSession, delays: number[] = [0]) {
+    if (!isAutoModel(s.state.model) || s.state.autoPick) return;
+    for (const ms of delays) setTimeout(() => this.resolveAutoPick(s).catch(() => {}), ms).unref?.();
+  }
+
+  /**
    * Conversa retomada ou restaurada sem nome (o título só chegava depois do fim de um turno): busca no
    * transcript agora. Servidor remoto ainda desconectado fica para quando conectar (evento 'status').
    */
   ensureTitle(s: ClaudeSession) {
+    this.scheduleAutoPick(s); // restaurada/retomada no modo automático: a escolha pode já estar decidida
     if (s.state.title || s.userTitle || !s.state.sessionId) return;
     if (s.isRemote && this.registry.status(s.state.hostId).state !== 'ready') return;
     if (Date.now() - s.titleTryAt < 30_000) return;

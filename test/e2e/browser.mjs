@@ -22,6 +22,16 @@ export async function openApp({ port, dataDir, width = 1600, height = 940, headl
   });
   const page = await browser.newPage();
   const errors = [];
+  /** Avisos "sair sem salvar?" (beforeunload) aceitos ao recarregar/fechar; os testes podem conferir. */
+  const unloadPrompts = [];
+  // Sem janela, ninguém responde o aviso do navegador: um F5 com arquivo não salvo deixava a página presa até o
+  // timeout (o aviso em si é o comportamento certo do app). Só o beforeunload é aceito sozinho; alert/confirm/prompt
+  // continuam com o teste.
+  page.on('dialog', (d) => {
+    if (d.type() !== 'beforeunload') return;
+    unloadPrompts.push(Date.now());
+    d.accept().catch(() => {});
+  });
   page.on('pageerror', (e) => errors.push(`pageerror: ${e.message}`));
   page.on('console', (m) => {
     if (m.type() === 'error') errors.push(`console: ${m.text()}`);
@@ -33,6 +43,7 @@ export async function openApp({ port, dataDir, width = 1600, height = 940, headl
     browser,
     page,
     errors,
+    unloadPrompts,
     async close() {
       await browser.close();
       try {

@@ -218,6 +218,13 @@ Passe o mouse sobre uma mensagem, sua ou do Claude, e clique no alfinete (ao lad
   embaixo em tela estreita, antes de escolher. `Enter`/`Espaço` escolhe.
 - Modos: Pedir permissão, Aceitar edições, Planejar, Automático e Ignorar permissões (`Shift+Tab` alterna).
 - `Esc` para o Claude. Mensagens enviadas enquanto ele trabalha entram na fila.
+- **Mensagem enviada no meio da tarefa.** O Claude Code a entrega ao modelo no ciclo seguinte (junto do
+  próximo resultado de ferramenta), mas o modelo às vezes a ignora e termina sem responder a ela. O Deck
+  entrega a mensagem; não tem como saber se o modelo a respondeu. Por isso, quando a tarefa acaba, a bolha
+  de cada mensagem enviada no meio dela ganha **"Reenviar como nova mensagem"**: um clique manda o mesmo
+  texto como mensagem normal, que o Claude sempre responde. O botão some ao reenviar, ao você escrever outra
+  coisa ou se o Claude abrir um turno novo para ela. Só vale para mensagens desta janela, ao vivo: não
+  reaparece depois de recarregar a página.
 - Composer: `/` sugere comandos, `@` menciona arquivos. Aceita imagens (colar, arrastar ou anexar).
 - **Resposta final x comentários.** Numa resposta com ferramentas, o texto do meio do trabalho
   (antes de uma ferramenta) aparece apagado e menor; o que vem depois da última ferramenta é a
@@ -244,6 +251,13 @@ Passe o mouse sobre uma mensagem, sua ou do Claude, e clique no alfinete (ao lad
   já vistas, da atividade mais recente para a mais antiga. Erro de uma ferramenta no meio do
   trabalho não conta: só o que travou a conversa vai para o grupo 1. Você pode arrastar uma aba à
   vontade; a ordem volta ao critério acima no próximo ciclo. `Ctrl+Alt+O` organiza na hora.
+- **Abas fixadas** (botão direito na aba → **Fixar aba**, menu **Mais** da conversa ou `Ctrl+Shift+P`):
+  a fixada vai para o fim das fixadas, que ficam sempre no começo da faixa — a 1ª, a 2ª, a 3ª… na ordem
+  em que você fixou. Arraste entre elas para mudar a ordem. A organização automática nunca mexe nelas.
+  No lugar do X aparece um alfinete; clicar nele desafixa e a aba volta para logo depois das fixadas.
+  Para não fechar sem querer, a fixada não fecha pelo botão do meio nem por `Ctrl+Shift+W`, e fica de fora
+  de "Fechar as outras" e "Fechar todas de…". Para fechar, use **Fechar** no menu da aba. A fixação fica
+  gravada com a janela e volta ao reabrir; `/clear` numa aba fixada mantém a conversa nova fixada.
 - Troca de modelo e **nível de esforço** (Baixo, Médio, Alto, Muito alto, Máximo), uso do contexto,
   `/clear`, renomear aba (duplo clique na aba ou F2: vira um campo; Enter grava, Esc cancela). O nome
   também é gravado no histórico do Claude Code. Ao lado do modelo aparece "N agentes" quando há
@@ -290,8 +304,91 @@ Passe o mouse sobre uma mensagem, sua ou do Claude, e clique no alfinete (ao lad
   *Todas as pastas* lista as outras pastas do mesmo servidor. Retomar uma conversa de outra pasta
   leva para a janela daquela pasta.
 
+## Orquestrador
+
+Para uma tarefa grande demais para uma conversa só (ex.: "no soft router, quero OSPF, BGP, RIP, OpenVPN,
+ZeroTier e algo tipo netwatch"). O orquestrador é uma conversa do Claude que planeja, divide o trabalho em
+tarefas e abre **uma conversa nova (worker) para cada tarefa**, cada uma com contexto limpo. Ele acompanha os
+workers até tudo estar concluído e verificado. Funciona igual no computador e nos servidores SSH: os workers
+rodam no mesmo servidor e na mesma pasta do orquestrador.
+
+- **Abrir**: botão de organograma ao lado do "+" das abas, menu **Mais** da conversa ("Novo
+  orquestrador nesta pasta…") ou `Ctrl+Shift+P` → "Novo orquestrador". O orquestrador usa a pasta das conversas
+  da janela.
+- **No diálogo** você descreve o objetivo e escolhe:
+  - a permissão dos workers (Pedir permissão, Aceitar edições, Automático, Ignorar permissões);
+  - quantos workers rodam ao mesmo tempo;
+  - modelo e esforço do orquestrador;
+  - se o plano precisa da sua aprovação (recomendado).
+- **Fluxo**:
+  1. O orquestrador estuda o projeto.
+  2. Faz só perguntas **gerais** de planejamento: prioridade, o que conta como "pronto", como testar.
+  3. Escreve o plano e registra as tarefas, com dependências e os arquivos que cada uma pode tocar.
+  4. Espera você clicar em **Aprovar plano**.
+  5. Cria os workers e acompanha até concluir.
+
+  Dúvidas específicas de uma tarefa o worker pergunta a você na aba dele.
+- **Modelo e esforço por worker**: o orquestrador escolhe conforme a dificuldade da tarefa. O esforço dos workers
+  é **Médio, Alto, Muito alto ou Máximo** (Médio para tarefa simples e bem especificada); o Deck recusa Baixo. O
+  próprio orquestrador fica em Alto ou acima. Um "modelo padrão dos workers" no diálogo vale quando o orquestrador
+  não escolher.
+- **Modelo esgotado no gateway**: se o gateway recusa o modelo de um worker ou do próprio orquestrador (429 "No
+  deployments available", sobrecarga, cota/orçamento, modelo inexistente), o Deck troca a conversa para outro
+  modelo disponível no servidor e manda continuar de onde parou. O transcript é o mesmo, então nada se perde.
+  - O modelo recusado fica bloqueado: pelo prazo que o gateway informar (de 1 min a 6 h; 30 min se não informar)
+    ou por 24 h se não existir. Ele some da lista que o orquestrador vê e o quadro mostra o aviso.
+  - O reserva prefere a mesma janela de contexto (`[1m]`) e a mesma família; nunca é "padrão" nem "automático".
+  - Erros de rede ou de credencial não trocam o modelo, porque outro modelo não resolveria.
+  - Sem modelo disponível, ou depois de 4 trocas seguidas sem sucesso, o worker vira erro para o orquestrador
+    decidir. Se for o orquestrador, a orquestração fica **Parada — precisa de você**, com aviso.
+- **Quadro** no topo da conversa do orquestrador:
+  - estado (Planejando, Esperando sua aprovação, Executando, Esperando você, Pausada, Parada, Concluída);
+  - resumo do plano e tarefas com dependências;
+  - um chip por worker (trabalhando, espera sua permissão/resposta, relatório, erro). Clique no chip para abrir
+    a aba do worker.
+
+  Botões: **Aprovar plano**, **Pausar/Retomar**, **Parar workers** e **Cancelar**.
+- **Nas abas**: o orquestrador tem um ícone próprio, que pisca quando precisa de você. Cada worker mostra o id
+  (`T1.1`). A faixa no topo do worker mostra a tarefa, o esforço e o modelo, e tem o botão **↑ Orquestrador**
+  para voltar.
+- **Grupo de abas**: o orquestrador e os workers dele ficam juntos, atrás de uma etiqueta colorida com o nome da
+  orquestração e uma linha da mesma cor embaixo de cada aba, como os grupos de abas do navegador. O grupo
+  aparece a partir de duas abas, e cada orquestração tem a sua cor.
+  - Clicar na etiqueta **recolhe/expande**. Recolhido, a etiqueta mostra quantas conversas há e o estado das que
+    estão escondidas (trabalhando, terminou, erro). A aba ativa e as que **esperam você** (permissão,
+    pergunta, plano para aprovar) continuam à vista.
+  - `Alt+1…9` e `Ctrl+Tab` andam só pelas abas à vista.
+  - Arrastar a etiqueta (ou a aba do orquestrador) move o grupo inteiro. Na organização automática, o grupo se
+    move como um bloco, pela conversa mais urgente dele.
+  - Botão direito na etiqueta: recolher/expandir, ir para o orquestrador e **Fechar o grupo** (pede confirmação).
+  - O estado recolhido fica gravado com a janela.
+  - Fixar uma aba do grupo tira essa aba do grupo e a leva para as fixadas.
+- **Regras que o Deck impõe**, não só o prompt:
+  - nenhum worker antes da aprovação;
+  - dependências concluídas antes de começar uma tarefa;
+  - duas tarefas em andamento não podem mexer nos mesmos arquivos;
+  - limite de workers simultâneos;
+  - workers sem ferramentas de orquestração (sem aninhamento);
+  - "concluída" só com evidência da verificação.
+- **Acompanhar até o fim**:
+  - Quando um worker manda o relatório, termina sem relatório, falha ou é fechado, o Deck acorda o
+    orquestrador com o evento, sem você precisar pedir.
+  - Se ainda houver tarefas abertas e nenhum worker trabalhando, o Deck lembra o orquestrador até 3 vezes. Depois
+    disso, a orquestração fica **Parada — precisa de você**, com aviso.
+- **Permissões**: o orquestrador não aprova permissões dos workers. Os pedidos aparecem na aba de cada worker para
+  você, e o chip do quadro fica amarelo.
+- **Arquivos**: o estado de cada orquestração fica em `.claude-deck/orq/<id>/`, dentro da pasta do projeto:
+  - `PLANO.md`, `STATE.md` e `tasks.json`;
+  - `briefs/`, com o briefing de cada worker;
+  - `reports/`, com os relatórios.
+
+  Um `.claude-deck/.gitignore` com `*` mantém a pasta fora do git; apague-o se quiser versionar. Os workers não
+  fazem commit. Se você pedir commit por tarefa, o orquestrador faz depois de verificar.
+- **Desenho e limites**: [docs/ORQUESTRADOR.md](docs/ORQUESTRADOR.md).
+
 ## Servidores SSH
 
+- **Entrar nas CLIs sem terminal:** na aba Servidores, clique com o botão direito no computador ou servidor e escolha **Entrar no Claude Code** ou **Entrar no Antigravity**. Abra o endereço mostrado e, se solicitado, cole o código de autorização no diálogo. O login acontece no usuário do destino escolhido; o Deck não altera o proxy. Fechar o diálogo cancela a tentativa. O reconhecimento das telas depende da versão instalada da CLI e pode não funcionar com todas as variantes.
 - O app lê o seu `~/.ssh/config`: `HostName`, `User`, `Port`, `IdentityFile`, `ConnectTimeout` e
   `HostKeyAlias`. Os favoritos e as pastas recentes foram importados do VS Code.
 - As chaves dos servidores são conferidas no `~/.ssh/known_hosts` (inclusive `[host]:porta`).
@@ -314,6 +411,18 @@ Passe o mouse sobre uma mensagem, sua ou do Claude, e clique no alfinete (ao lad
   primeira conversa naquele servidor. Se a rede cair, o notebook dormir ou o app reiniciar, o app
   reanexa e continua de onde parou, sem perder nem repetir mensagens. Uma conversa parada há mais
   de 6 h (ajustável) é encerrada no servidor; o histórico fica, e a próxima mensagem retoma.
+- **Retomar sozinho quando o Claude é derrubado (código 137).** Um monitor do servidor, o OOM killer ou
+  um `kill -9` matam o processo à força, e o chat mostra *"O Claude encerrou (código 137)"* no meio da
+  tarefa. Em **Configurações → Conversas** (vem **desligado**), a opção *Retomar sozinho…* faz o Deck
+  esperar alguns segundos e mandar uma mensagem curta (padrão `continue`, editável) pelo mesmo caminho
+  de quando você escreve: o processo sobe com `--resume` e o Claude segue de onde parou. Só age se ele
+  estava **trabalhando** (ou esperando uma permissão); queda com a conversa parada não manda nada.
+  Cada queda seguida espera o dobro (5 s, 10 s, 20 s… até 60 s) e, depois de *N* quedas em até 5 min
+  uma da outra (padrão 5), o Deck desiste e avisa, para não gastar créditos em laço. Um turno que
+  termina zera a contagem. **Parar**, fechar a aba, escrever você mesmo ou desligar a opção durante a
+  espera cancelam. Só vale para o código 137: encerramentos normais, `Parar` e a pausa por inatividade
+  (143) não disparam. Exige o programa em segundo plano do Deck atualizado (reinicie com as conversas
+  ociosas); com o antigo, a opção aparece mas não faz nada.
 - **Clicar numa pasta recente (aba Servidores) vai para a janela dessa pasta:** se está aberta, ela
   vem para a frente; se foi fechada, reabre com **as mesmas conversas e arquivos** — 3 abas fechadas
   voltam como as mesmas 3, não como uma conversa nova; se nunca foi aberta, abre com uma conversa
@@ -416,7 +525,7 @@ as ferramentas de terminal; não fecha o shell nem desfaz o que já foi executad
 |---|---|
 | `Ctrl+Shift+N` | Nova conversa (escolhe o servidor e a pasta) |
 | `Ctrl+N` / `Ctrl+T` | Nova conversa na mesma pasta |
-| `Ctrl+Tab` / `Ctrl+Shift+Tab`, `Alt+1…9` | Trocar de conversa (por posição na faixa de abas) |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab`, `Alt+1…9` | Trocar de conversa (por posição na faixa de abas; as escondidas num grupo recolhido não contam) |
 | `Ctrl+Alt+O` | Organizar as abas agora (terminou › pede resposta › trabalhando › paradas) |
 | `Ctrl+Shift+W` | Fechar conversa |
 | `F2` | Renomear a conversa ativa (no explorador, renomeia o arquivo) |
@@ -435,6 +544,8 @@ as ferramentas de terminal; não fecha o shell nem desfaz o que já foi executad
 - `%APPDATA%\claude-deck`: configurações, `browser.json`, servidores favoritos e recentes, abas abertas (por
   janela, em `state.json`), perfis de navegador do app (`browser-profile` ou `browser-profile-<id>`), token e `server.log`.
 - Histórico das conversas: o do próprio Claude Code (`~/.claude/projects`, local ou no servidor).
+- Orquestrações: o registro (quem é orquestrador/worker, tarefas, eventos) em `%APPDATA%\claude-deck\orchestrations.json`.
+  Plano, briefings e relatórios ficam em `.claude-deck/orq/` na pasta do projeto (local ou no servidor).
 - No servidor: `~/.cache/claude-deck` guarda o script e a saída das conversas em andamento.
   Sessões mortas há mais de 2 dias são limpas sozinhas.
 
@@ -451,6 +562,8 @@ npm run test:terminal:ui   # MCP + PTY real + terminal à direita, com Claude fa
 npm run test:cache:ui      # contador do cache de prompt (relógio adiantado na página), com Claude falso e Brave isolado
 npm run test:context:ui    # pizza e /context abrem modal; botão compacta ou enfileira sem duplicar (Brave isolado + Claude falso)
 npm run test:pins:ui       # fixar mensagem, voltar a ela com 1 clique (inclusive uma antiga), F5 e desafixar (Brave isolado + Claude falso)
+npm run test:orq:ui       # orquestrador: criar, aprovar o plano, worker em aba própria, relatório acorda o orquestrador, F5 (Brave isolado + Claude falso)
+# piloto do orquestrador com o Claude REAL (gasta créditos; teto US$ 5 / 25 min): $env:DECK_REAL_ORQ=1; npx vitest run --config vitest.integration.config.ts test/integration/real-orchestrator.test.ts
 npm run test:autocompact:ui # pizza com a compactação automática definida (500k, 250k, desligada, erro), com Claude falso e Brave isolado
 npm run test:shortcuts     # atalhos com teclado real (abre uma janela de teste por ~1 min)
 npm run test:memory        # 25 conversas remotas + 5 locais abertas ao mesmo tempo
@@ -464,7 +577,8 @@ npm run test:all           # typecheck + unitários + integração + E2E + remot
 Os testes nunca usam o Brave do dia a dia, o `~/.claude` nem os servidores de clientes. Rodam com
 perfis e pastas temporárias, com o projeto `test/fixtures/sandbox` e com um "Claude falso"
 (`test/fake-claude`). A checagem dos servidores reais é só leitura e opcional
-(`DECK_CHECK_ALL=1`), e o teste com o Claude de verdade gasta centavos (`DECK_REAL=1`).
+(`DECK_CHECK_ALL=1`), e o teste com o Claude de verdade gasta centavos (`DECK_REAL=1`). O piloto do orquestrador
+usa uma variável própria (`DECK_REAL_ORQ=1`) e custou cerca de US$ 0,50–0,70 por execução.
 
 ## Desinstalar
 

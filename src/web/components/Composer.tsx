@@ -9,23 +9,29 @@ import {
   isLiveTerminal,
   sendMessage,
   setChatMode,
+  setChatAutoApprove,
   setChatModel,
   setChatEffort,
+  setChatEngine,
   toggleChatExecutionMode,
   settings,
   toast,
   openContextModal,
   platformOf,
+  hostStatus,
+  installHostAgy,
+  installingAgy,
   type ChatTab,
 } from '../lib/state';
 import { flattenToolResult, type AgentRun, type ImageData } from '../lib/chatModel';
-import type { EffortLevel, PermissionMode } from '../../shared/types';
+import type { EffortLevel, PermissionMode, ModelOption } from '../../shared/types';
 import { Icon } from './icons';
 import { openMenu } from './ContextMenu';
 import { fuzzyScore } from '../lib/format';
 import { cachePillLabel, cacheTooltip, cacheWindowAt } from '../lib/promptCache';
 import { contextAriaLabel, contextMeter, contextTooltip, contextUnknownTooltip, pieStroke } from '../lib/contextUsage';
 import { basename, relativeTo } from '../../shared/paths';
+import { isAutoModel, matchModelOption } from '../../shared/automodel';
 
 export const MODE_LABELS: Record<PermissionMode, { label: string; icon: string; desc: string }> = {
   default: { label: 'Pedir permissão', icon: 'shield', desc: 'Pergunta antes de editar arquivos e rodar comandos' },
@@ -48,6 +54,9 @@ const BUILTIN_COMMANDS = [
 ];
 
 const MAX_IMAGE_BYTES = 3.75 * 1024 * 1024;
+
+const MAX_PROMPT_LENGTH_WARNING = 50_000;
+const ULTRATHINK_RE = /(?:^|\s|\/)(?:ultrathink)(?:\s|$)/i;
 
 async function fileToImage(f: File): Promise<ImageData | null> {
   if (!f.type.startsWith('image/')) return null;
@@ -259,7 +268,21 @@ export function Composer({ c }: { c: ChatTab }) {
   const procStart = st.processStartedAt ?? (processAlive ? (st.createdAt ?? 0) : undefined);
   const agents = processAlive ? c.model.runningAgents(procStart) : [];
   const running = c.model.running || st.phase === 'running' || agents.length > 0;
-  const hostCaps = caps.value[st.hostId];
+  const [agyList, setAgyList] = useState<{ hostId: string; models: ModelOption[]; error?: string } | null>(null);
+  const isAgy = st.engine === 'antigravity';
+  useEffect(() => {
+    if (!isAgy) return;
+    let cancelled = false;
+    setAgyList(null);
+    rpc.call<ModelOption[]>('sessions.agyModels', { hostId: st.hostId }, 30000).then((models) => {
+      if (!cancelled) setAgyList({ hostId: st.hostId, models });
+    }).catch((err) => {
+      if (!cancelled) setAgyList({ hostId: st.hostId, models: [], error: err instanceof RpcError && err.code === 'nomethod' ? 'Atualize o daemon do Deck para listar modelos do Antigravity.' : 'Não foi possível listar os modelos do Antigravity.' });
+    });
+    return () => { cancelled = true; };
+  }, [st.hostId, isAgy]);
+  // Capacidades de Claude não são prova de capacidades do Antigravity.
+  const hostCaps = isAgy ? undefined : caps.value[st.hostId];
   const mode = (st.permissionMode ?? 'default') as PermissionMode;
   const f = activeFile.value;
   const fileCtx = f && f.hostId === st.hostId ? f : null;
@@ -380,8 +403,14 @@ export function Composer({ c }: { c: ChatTab }) {
     });
   };
 
+  const isUltrathink = ULTRATHINK_RE.test(text);
+  const isTooLong = text.length > MAX_PROMPT_LENGTH_WARNING;
+
   const send = () => {
     if (!text.trim() && !images.length) return;
+    if (isUltrathink && shownEffort !== 'xhigh' && shownEffort !== 'max') {
+      void setChatEffort(c, 'xhigh');
+    }
     const ctx = editorContextFor(c, selection, includeFile && !!fileCtx);
     sendMessage(c, text, images, ctx);
     setText('');
@@ -466,8 +495,17 @@ export function Composer({ c }: { c: ChatTab }) {
 
   const modeInfo = MODE_LABELS[mode] ?? MODE_LABELS.default;
   const live = isLiveTerminal(c);
-  const models = hostCaps?.models ?? [];
-  const modelLabel = st.model ? (models.find((m) => m.value === st.model || st.model!.startsWith(m.value))?.displayName ?? st.model) : 'Modelo';
+  const models = isAgy ? (agyList?.hostId === st.hostId ? agyList.models : []) : (hostCaps?.models ?? []);
+  const nameOf = (value: string) => models.find((m) => m.value === value || value.startsWith(m.value))?.displayName ?? value;
+  // Modo automático: o CLI roda com o automático, mas o gateway já escolheu um modelo para a conversa. Mostra o escolhido.
+  const autoPick = isAutoModel(st.model) ? st.autoPick : undefined;
+  const autoPickName = autoPick ? nameOf(matchModelOption(autoPick.model, models)) : undefined;
+  const modelLabel = autoPickName ?? (st.model ? nameOf(st.model) : 'Modelo');
+  const modelTitle = autoPick
+    ? `Modo automático: o gateway escolheu ${autoPickName}${autoPick.effort ? `, esforço ${EFFORT_LABELS[autoPick.effort].toLowerCase()}` : ''}${autoPick.label ? ` (${autoPick.label})` : ''} para esta conversa.`
+    : isAutoModel(st.model)
+      ? 'Modo automático: o gateway escolhe o modelo no 1º pedido da conversa.'
+      : 'Modelo desta conversa';
   const pendingCount = c.model.pendingCount;
   // Uma permissão que chega enquanto o painel dos agentes está aberto precisa ficar visível imediatamente.
   useEffect(() => {
@@ -476,11 +514,19 @@ export function Composer({ c }: { c: ChatTab }) {
   // O esforço vale na hora, até no meio de uma tarefa (o CLI aplica na próxima chamada ao modelo).
   // Só espera enquanto o Claude conecta ou se não há processo para receber a mudança.
   const effortBusy = ['starting', 'reconnecting', 'error', 'ended'].includes(st.phase);
-  const effortLabel = st.effort ? EFFORT_LABELS[st.effort] : 'Padrão';
+  // Sem esforço escolhido aqui, vale o que o gateway decidiu junto com o modelo.
+  const shownEffort = st.effort ?? autoPick?.effort;
+  const effortLabel = shownEffort ? EFFORT_LABELS[shownEffort] : 'Padrão';
 
   return (
     <>
       <div class="composer-wrap">
+      {isTooLong && (
+        <div class="composer-warning">
+          <Icon name="warning" style={{ fontSize: 13, color: 'var(--warn)' }} />
+          <span>Atenção: prompt muito longo ({text.length.toLocaleString()} caracteres). O limite recomendado para evitar truncamento é de 50.000 caracteres.</span>
+        </div>
+      )}
       {pendingCount > 0 && (
         <div style={{ maxWidth: 920, margin: '0 auto 6px', display: 'flex', justifyContent: 'center' }}>
           <button class="btn" style={{ background: '#9a6700' }} onClick={() => document.querySelector('.chat .messages .tool.pending-perm')?.scrollIntoView({ behavior: 'smooth', block: 'end' })}>
@@ -489,7 +535,7 @@ export function Composer({ c }: { c: ChatTab }) {
         </div>
       )}
       <div
-        class={`composer${drag ? ' drag' : ''}`}
+        class={`composer${drag ? ' drag' : ''}${isUltrathink ? ' ultrathink' : ''}`}
         onDragOver={(e) => {
           if (e.dataTransfer?.types.includes('Files') || e.dataTransfer?.types.includes('application/x-deck-path')) {
             e.preventDefault();
@@ -569,6 +615,40 @@ export function Composer({ c }: { c: ChatTab }) {
         />
         <div class="composer-bar">
           <button
+            class="pill-select engine-pill"
+            title={`Motor da conversa: ${st.engine === 'antigravity' ? 'Antigravity CLI (agy)' : 'Claude Code'}. Clique para alternar.`}
+            onClick={(e) => {
+              const hasAgy = hostStatus.value[st.hostId]?.agy;
+              const isInstalling = installingAgy.value.has(st.hostId);
+              openMenu(e as any, [
+                {
+                  label: `Claude Code${(!st.engine || st.engine === 'claude') ? '  ✓' : ''}`,
+                  icon: 'hubot',
+                  action: () => setChatEngine(c, 'claude'),
+                },
+                hasAgy
+                  ? {
+                      label: `Antigravity CLI (agy)${st.engine === 'antigravity' ? '  ✓' : ''}`,
+                      icon: 'sparkle',
+                      action: () => setChatEngine(c, 'antigravity'),
+                    }
+                  : {
+                      label: isInstalling ? 'Instalando Antigravity CLI…' : 'Antigravity CLI (não instalado — instalar agora)',
+                      icon: isInstalling ? 'loading' : 'cloud-download',
+                      disabled: isInstalling,
+                      action: async () => {
+                        const ok = await installHostAgy(st.hostId);
+                        if (ok) setChatEngine(c, 'antigravity');
+                      },
+                    },
+              ]);
+            }}
+          >
+            <Icon name={st.engine === 'antigravity' ? 'sparkle' : 'hubot'} style={{ fontSize: 13, color: st.engine === 'antigravity' ? '#8ab4f8' : 'var(--claude)' }} />
+            <span>Motor: {st.engine === 'antigravity' ? 'Antigravity (agy)' : 'Claude Code'}</span>
+            <Icon name="chevron-down" style={{ fontSize: 9, opacity: 0.6, marginLeft: 2 }} />
+          </button>
+          <button
             class={`pill-select mode-${mode}`}
             title={`${modeInfo.desc}\n(Shift+Tab alterna)`}
             onClick={(e) =>
@@ -586,6 +666,17 @@ export function Composer({ c }: { c: ChatTab }) {
             <Icon name={modeInfo.icon} style={{ fontSize: 13 }} /> {modeInfo.label}
           </button>
           <button
+            class={`pill-select${st.autoApprove ? ' mode-bypassPermissions' : ''}`}
+            title={
+              st.autoApprove
+                ? 'Aprovar sozinho LIGADO: o Deck permite automaticamente todo pedido de permissão desta conversa (perguntas e aprovação de plano continuam esperando você). Clique para desligar.'
+                : 'Aprovar sozinho: clique para o Deck permitir automaticamente os pedidos de permissão desta conversa, inclusive os que já estão esperando. Útil quando você vai sair do PC.'
+            }
+            onClick={() => setChatAutoApprove(c, !st.autoApprove)}
+          >
+            <Icon name={st.autoApprove ? 'check-all' : 'shield'} style={{ fontSize: 13 }} /> {st.autoApprove ? 'Aprovando sozinho' : 'Aprovar sozinho'}
+          </button>
+          <button
             class={`pill-select${live ? ' mode-live-terminal' : ''}`}
             title={
               live
@@ -599,15 +690,21 @@ export function Composer({ c }: { c: ChatTab }) {
           </button>
           <button
             class="pill-select"
-            title="Modelo desta conversa"
+            title={modelTitle}
             onClick={(e) =>
               openMenu(e as any, [
-                { label: 'Padrão do servidor', icon: 'circle-large-outline', action: () => setChatModel(c, null) },
+                { label: 'Padrão do servidor', icon: 'circle-large-outline', disabled: isAgy && processAlive, action: () => setChatModel(c, null) },
                 ...(models.length ? [{ separator: true }] : []),
                 ...models
                   .filter((m) => m.value !== 'default')
-                  .map((m) => ({ label: `${m.displayName}${st.model === m.value ? '  ✓' : ''}`, icon: 'hubot', action: () => setChatModel(c, m.value) })),
-                ...(!models.length ? [{ label: 'Lista de modelos aparece após o Claude iniciar', icon: 'info', disabled: true }] : []),
+                  .map((m) => ({
+                    label: `${m.displayName}${st.model === m.value ? `  ✓${autoPickName ? ` (escolheu ${autoPickName})` : ''}` : ''}`,
+                    icon: 'hubot',
+                    disabled: isAgy && processAlive,
+                    action: () => setChatModel(c, m.value),
+                  })),
+                ...(isAgy && processAlive ? [{ label: 'Troca de modelo com Antigravity ativo ainda não é suportada', icon: 'info', disabled: true }] : []),
+                ...(!models.length ? [{ label: isAgy ? (agyList?.error || 'Consultando modelos do Antigravity…') : 'Lista de modelos aparece após o Claude iniciar', icon: 'info', disabled: true }] : []),
                 { separator: true },
                 { label: effortBusy ? 'Nível de esforço (aguarde o Claude conectar)' : 'Nível de esforço', icon: 'info', disabled: true },
                 { label: `Padrão do Claude Code${!st.effort ? '  ✓' : ''}`, icon: 'circle-large-outline', disabled: effortBusy, action: () => setChatEffort(c, null) },
@@ -621,6 +718,7 @@ export function Composer({ c }: { c: ChatTab }) {
             }
           >
             <Icon name="hubot" style={{ fontSize: 13 }} /> {modelLabel} · {effortLabel}
+            <Icon name="chevron-down" style={{ fontSize: 9, opacity: 0.6, marginLeft: 2 }} />
           </button>
           {agentMap.length > 0 && (
             <button class={`pill-select agents-pill${agentFailed ? ' failed' : ''}`} title={`${agentsTooltip(agents)}\nClique para abrir o mapa.`} onClick={() => setAgentsOpen(true)}>
@@ -667,8 +765,12 @@ export function Composer({ c }: { c: ChatTab }) {
       <div class="composer-hint">
         <span>
           {settings.value.sendWithCtrlEnter ? 'Ctrl+Enter envia · Enter quebra linha' : 'Enter envia · Shift+Enter quebra linha'} · Esc para · Shift+Tab muda o modo
+          {isUltrathink && <strong class="ultrathink-badge"> · ultrathink (esforço muito alto)</strong>}
         </span>
-        <span>{st.claudeVersion ? `Claude Code ${st.claudeVersion}` : ''}</span>
+        <span>
+          {text.length > 2000 ? `${text.length.toLocaleString()} caracteres · ` : ''}
+          {st.claudeVersion ? `Claude Code ${st.claudeVersion}` : ''}
+        </span>
       </div>
       </div>
       {agentsOpen && agentMap.length > 0 && <AgentRunsDialog c={c} agents={agentMap} onClose={() => setAgentsOpen(false)} />}

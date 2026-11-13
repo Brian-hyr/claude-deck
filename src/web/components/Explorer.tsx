@@ -19,6 +19,7 @@ import {
   hostLabel,
   hostStatus,
   newChat,
+  newOrqDialog,
   openFile,
   openWorkspace,
   platformOf,
@@ -1361,6 +1362,7 @@ export function FolderBrowser() {
     }
     close();
     if (fb.purpose === 'chat') newChat(fb.hostId, p);
+    else if (fb.purpose === 'orq') newOrqDialog.value = { hostId: fb.hostId, cwd: p };
     else if (fb.purpose === 'add-root') addExtraRoot(fb.hostId, p);
     else openWorkspace(fb.hostId, p);
   };
@@ -1369,11 +1371,13 @@ export function FolderBrowser() {
     <div class="overlay" onMouseDown={close}>
       <div class="dialog wide" onMouseDown={(e) => e.stopPropagation()}>
         <div class="dialog-head">
-          <Icon name={fb.purpose === 'chat' ? 'comment-discussion' : fb.purpose === 'move' ? 'move' : 'folder-opened'} />
+          <Icon name={fb.purpose === 'chat' ? 'comment-discussion' : fb.purpose === 'orq' ? 'organization' : fb.purpose === 'move' ? 'move' : 'folder-opened'} />
           <span class="grow">
             {fb.purpose === 'chat'
               ? 'Nova conversa em…'
-              : fb.purpose === 'add-root'
+              : fb.purpose === 'orq'
+                ? 'Orquestrador na pasta do projeto…'
+                : fb.purpose === 'add-root'
                 ? 'Adicionar pasta ao explorador'
                 : fb.purpose === 'move'
                   ? `Mover ${moving ? basename(moving.path) : ''} para…`
@@ -1432,7 +1436,7 @@ export function FolderBrowser() {
             Cancelar
           </button>
           <button class="btn" disabled={!cur || !!err || !!moveProblem} onClick={() => choose(cur)}>
-            {fb.purpose === 'chat' ? 'Iniciar conversa aqui' : fb.purpose === 'add-root' ? 'Adicionar esta pasta' : fb.purpose === 'move' ? 'Mover para esta pasta' : 'Abrir esta pasta'}
+            {fb.purpose === 'chat' ? 'Iniciar conversa aqui' : fb.purpose === 'orq' ? 'Usar esta pasta' : fb.purpose === 'add-root' ? 'Adicionar esta pasta' : fb.purpose === 'move' ? 'Mover para esta pasta' : 'Abrir esta pasta'}
           </button>
         </div>
       </div>

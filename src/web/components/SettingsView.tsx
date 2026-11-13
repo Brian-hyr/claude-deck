@@ -1,7 +1,7 @@
 // Configurações do app.
 import { useEffect, useState } from 'preact/hooks';
 import { rpc } from '../lib/rpc';
-import { caps, hosts, hostStatus, settings, stats, toast, updateSettings, errorText } from '../lib/state';
+import { caps, hosts, hostStatus, settings, stats, toast, updateSettings, errorText, openClaudeSettingsModal, openClaudeSettingsFile } from '../lib/state';
 import type { ModelOption, PermissionMode, SessionCapabilities } from '../../shared/types';
 import { MODE_LABELS } from './Composer';
 import { formatBytes } from '../lib/format';
@@ -82,6 +82,14 @@ export function SettingsView() {
 
       <h3>Conversas</h3>
       <div class="field">
+        <label>Motor de IA padrão</label>
+        <select class="input" value={s.defaultEngine || 'claude'} onChange={(e) => updateSettings({ defaultEngine: (e.target as HTMLSelectElement).value as any })}>
+          <option value="claude">Claude Code CLI</option>
+          <option value="antigravity">Antigravity CLI (agy)</option>
+        </select>
+        <span class="hint">Motor executado por padrão ao iniciar novas conversas.</span>
+      </div>
+      <div class="field">
         <label>Modo de permissão para conversas novas</label>
         <select class="input" value={s.defaultPermissionMode} onChange={(e) => updateSettings({ defaultPermissionMode: (e.target as HTMLSelectElement).value as PermissionMode })}>
           {(['default', 'acceptEdits', 'plan', 'auto', 'bypassPermissions'] as PermissionMode[]).map((m) => (
@@ -126,6 +134,33 @@ export function SettingsView() {
         <input class="input" type="number" value={s.remoteIdleHours} min={1} max={168} onInput={num('remoteIdleHours', 1, 168)} />
         <span class="hint">No servidor, a conversa continua rodando mesmo com o notebook desligado. Depois desse tempo sem uso, o processo é encerrado (o histórico fica; a próxima mensagem retoma).</span>
       </div>
+      <label class="check">
+        <input type="checkbox" checked={!!s.autoResumeOnKill} onChange={(e) => updateSettings({ autoResumeOnKill: (e.target as HTMLInputElement).checked })} />
+        <span>Retomar sozinho quando o Claude for derrubado no meio da tarefa (código 137)</span>
+      </label>
+      <span class="hint">
+        O código 137 é o processo morto à força (monitor do servidor, falta de memória, kill -9). Com isto ligado, o Deck espera alguns segundos e envia a mensagem abaixo para o Claude seguir de onde parou. Só age se ele estava
+        trabalhando; "Parar" e fechar a aba cancelam. Cada queda seguida espera o dobro (5 s, 10 s, 20 s...).
+      </span>
+      {s.autoResumeOnKill && (
+        <div style={{ display: 'flex', gap: 8 }}>
+          <div class="field" style={{ flex: 2 }}>
+            <label>Mensagem enviada ao retomar</label>
+            <input
+              class="input"
+              type="text"
+              value={s.autoResumeMessage ?? ''}
+              placeholder="continue"
+              maxLength={200}
+              onInput={(e) => updateSettings({ autoResumeMessage: (e.target as HTMLInputElement).value })}
+            />
+          </div>
+          <div class="field" style={{ flex: 1 }}>
+            <label>Quedas seguidas até desistir</label>
+            <input class="input" type="number" value={s.autoResumeMax ?? 5} min={1} max={20} onInput={num('autoResumeMax', 1, 20)} />
+          </div>
+        </div>
+      )}
 
       <h3>Editor</h3>
       <label class="check">
@@ -162,6 +197,20 @@ export function SettingsView() {
 
       <h3>Claude Code</h3>
       <div class="field">
+        <label>Configurações do Claude Code (settings.json)</label>
+        <span class="hint" style={{ marginBottom: 8 }}>
+          Configuração de gateway/LiteLLM, chaves, modelos customizados do seletor, permissões e raciocínio.
+        </span>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          <button class="btn secondary" onClick={() => openClaudeSettingsModal()}>
+            <Icon name="settings-gear" /> Editor Visual
+          </button>
+          <button class="btn secondary" onClick={() => openClaudeSettingsFile()}>
+            <Icon name="code" /> Abrir settings.json
+          </button>
+        </div>
+      </div>
+      <div class="field">
         <label>Executável local</label>
         <select class="input" value={s.localClaudePath} onChange={(e) => updateSettings({ localClaudePath: (e.target as HTMLSelectElement).value })}>
           <option value="">Automático (versão mais nova)</option>
@@ -179,6 +228,15 @@ export function SettingsView() {
             .filter((h) => h.kind === 'ssh' && hostStatus.value[h.id]?.claude)
             .map((h) => `${h.id}: ${hostStatus.value[h.id]!.claude!.version}`)
             .join(' · ') || 'Conecte a um servidor para ver.'}
+        </div>
+      </div>
+      <div class="field">
+        <label>Servidores com Antigravity CLI detectado</label>
+        <div class="hint">
+          {hosts.value
+            .filter((h) => h.kind === 'ssh' && hostStatus.value[h.id]?.agy)
+            .map((h) => `${h.id}: ${hostStatus.value[h.id]!.agy!.version}`)
+            .join(' · ') || 'Nenhum servidor com Antigravity detectado ainda.'}
         </div>
       </div>
 

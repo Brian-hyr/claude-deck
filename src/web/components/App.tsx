@@ -12,6 +12,7 @@ import {
   editorVisible,
   editorWidth,
   files,
+  jumpToFirstMessage,
   newChat,
   newChatPicker,
   pendingCountFor,
@@ -28,6 +29,9 @@ import {
   authPrompts,
   settings,
   sortChatsNow,
+  isChatPinned,
+  tabStrip,
+  toast,
   terminalHeight,
   terminalVisible,
   terminalWidth,
@@ -53,6 +57,9 @@ import { ContextMenuHost } from './ContextMenu';
 import { AuthPromptDialog, GenericDialogs, Toasts } from './Dialogs';
 import { CommandPalette, NewChatPicker, QuickOpen } from './Pickers';
 import { ContextModal } from './ContextModal';
+import { ClaudeSettingsModal } from './ClaudeSettingsModal';
+import { NewOrchestratorDialog } from './Orchestrator';
+import { CliAuthDialog } from './CliAuthDialog';
 
 const VIEWS: { id: SidebarView; icon: string; title: string }[] = [
   { id: 'explorer', icon: 'files', title: 'Explorador (Ctrl+Shift+E)' },
@@ -185,7 +192,8 @@ function useShortcuts() {
         sidebarVisible.value = true;
       } else if (ctrl && e.key === 'Tab') {
         e.preventDefault();
-        const list = chats.value;
+        // Só as abas à vista: as de um grupo recolhido ficam de fora (como no navegador).
+        const list = tabStrip.value.visible;
         if (!list.length) return;
         const i = list.findIndex((c) => c.sid === activeChatId.value);
         const next = list[(i + (e.shiftKey ? -1 : 1) + list.length) % list.length];
@@ -193,7 +201,9 @@ function useShortcuts() {
       } else if (ctrl && e.shiftKey && k === 'w') {
         e.preventDefault();
         const c = activeChat.value;
-        if (c) closeChat(c.sid);
+        // Aba fixada não fecha pelo atalho (nem pelo botão do meio): só pelo "Fechar" do menu da aba.
+        if (c && isChatPinned(c.sid)) toast('Esta aba está fixada. Desafixe primeiro, ou use "Fechar" no menu da aba.', 'info', 4000);
+        else if (c) closeChat(c.sid);
       } else if (ctrl && !e.shiftKey && k === 'w') {
         // Ctrl+W fecha o arquivo ativo se o foco estiver no painel de arquivos.
         // Fora dele não faz nada (sem isso, a janela do app fecharia).
@@ -207,6 +217,14 @@ function useShortcuts() {
         const c = activeChat.value;
         if (c) newChat(c.state.value.hostId, c.state.value.cwd);
         else newChatPicker.value = {};
+      } else if (ctrl && (e.key === 'Home' || e.code === 'Home')) {
+        const target = e.target as HTMLElement | null;
+        if (target?.closest('.cm-editor') || target?.tagName === 'TEXTAREA' || target?.tagName === 'INPUT') return;
+        const c = activeChat.value;
+        if (c && c.model.items.length > 0) {
+          e.preventDefault();
+          jumpToFirstMessage(c.sid);
+        }
       } else if (ctrl && !e.shiftKey && k === 's') {
         const f = activeFile.value;
         e.preventDefault();
@@ -215,7 +233,7 @@ function useShortcuts() {
         if ((e.target as HTMLElement)?.closest('.cm-editor')) return;
         if (f?.dirty.value) saveFile(f);
       } else if (e.altKey && /^[1-9]$/.test(e.key)) {
-        const c = chats.value[Number(e.key) - 1];
+        const c = tabStrip.value.visible[Number(e.key) - 1];
         if (c) {
           e.preventDefault();
           activateChat(c.sid);
@@ -316,8 +334,11 @@ export function App() {
       <CommandPalette />
       <FolderBrowser />
       <AddHostDialog />
+      <CliAuthDialog />
       <FileCopyPanel />
       <ContextModal />
+      <ClaudeSettingsModal />
+      <NewOrchestratorDialog />
       <GenericDialogs />
       <AuthPromptDialog />
       <Lightbox />

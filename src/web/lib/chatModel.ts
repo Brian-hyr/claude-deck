@@ -45,8 +45,12 @@ export interface TaskNotificationData {
 
 /** Mensagem que outro agente (subagente, colega de equipe, outra sessão do Claude) mandou para esta conversa. */
 export interface AgentMessageData {
-  /** `agent` = subagente/colega desta sessão (<agent-message>); `session` = outra sessão do Claude (<cross-session-message>). */
-  kind?: 'agent' | 'session';
+  /**
+   * `agent` = subagente/colega desta sessão (<agent-message>); `session` = outra sessão do Claude (<cross-session-message>);
+   * `orchestrator` = briefing/mensagem do orquestrador do Claude Deck para um worker (<orchestrator-message>);
+   * `deck` = aviso do Claude Deck ao orquestrador: eventos dos workers, aprovação, lembretes (<orq-update>).
+   */
+  kind?: 'agent' | 'session' | 'orchestrator' | 'deck';
   /** Id do agente que enviou (atributo `from`). */
   from?: string;
   /** Nome legível do remetente, quando o CLI informa (`origin.name`: "Explore", "smart-ia-06"). */
@@ -65,6 +69,15 @@ export interface UserItem {
   images: ImageData[];
   pending?: boolean;
   failed?: string;
+  /**
+   * Enviada por esta janela com o Claude no meio de uma tarefa. O CLI a entrega ao modelo no ciclo seguinte, mas o modelo
+   * às vezes a ignora e termina sem responder (visto em transcripts reais). Só existe ao vivo: não vem do histórico.
+   */
+  midTurn?: boolean;
+  /** Contador de turnos do modelo no envio: a mensagem só vira "reenviável" depois que esse turno acaba. */
+  sentTurn?: number;
+  /** Já reenviada como mensagem nova (o botão de reenviar some). */
+  resent?: boolean;
   /** Data/hora do envio (ms). Enviada por esta janela: o momento do clique; do transcript/eco do CLI: o `timestamp` dele. */
   at?: number;
   /** Quem produziu a mensagem. Só `user` (ou ausente) é algo que o usuário digitou; o resto é automático. */
@@ -162,6 +175,8 @@ export interface ResultItem {
   sessionTokens?: TokenUsage;
   /** Data/hora de término/chegada do resultado (ms). */
   at?: number;
+  /** Reconstruído a partir do histórico/transcript (o CLI do Claude Code não grava eventos result no disco). */
+  synthetic?: boolean;
 }
 export interface NoticeItem {
   kind: 'notice';
@@ -390,7 +405,13 @@ export function parseTaskNotification(raw: string): TaskNotificationData | null 
   return parseTaskNotifications(raw)[0] ?? null;
 }
 
-const AGENT_MESSAGE_RE = /<(agent-message|cross-session-message)\b([^>]*)>([\s\S]*?)<\/\1>/g;
+const AGENT_MESSAGE_RE = /<(agent-message|cross-session-message|orchestrator-message|orq-update)\b([^>]*)>([\s\S]*?)<\/\1>/g;
+const AGENT_KIND: Record<string, AgentMessageData['kind']> = {
+  'agent-message': 'agent',
+  'cross-session-message': 'session',
+  'orchestrator-message': 'orchestrator',
+  'orq-update': 'deck',
+};
 /** Frase que o CLI põe antes da tag quando a mensagem chega no meio do trabalho. */
 const AGENT_PREFIX_RE = /^\s*Another Claude session sent a message(?: while you were working)?:\s*/i;
 
@@ -402,12 +423,18 @@ const AGENT_PREFIX_RE = /^\s*Another Claude session sent a message(?: while you 
  * `origin` é o campo que o CLI manda junto (nome legível do remetente).
  */
 export function parseAgentMessages(raw: string, origin?: any): AgentMessageData[] | null {
-  if (!raw.includes('<agent-message') && !raw.includes('<cross-session-message')) return null;
+  if (!raw.includes('<agent-message') && !raw.includes('<cross-session-message') && !raw.includes('<orchestrator-message') && !raw.includes('<orq-update')) return null;
   const out: AgentMessageData[] = [];
   for (const m of raw.matchAll(AGENT_MESSAGE_RE)) {
+    const kind = AGENT_KIND[m[1]] ?? 'agent';
     const from = m[2].match(/\bfrom="([^"]*)"/)?.[1] || undefined;
-    const name = origin?.kind === 'peer' && typeof origin.name === 'string' && (!origin.from || origin.from === from) ? origin.name : undefined;
-    out.push({ kind: m[1] === 'cross-session-message' ? 'session' : 'agent', from, name, body: m[3].trim() });
+    const name =
+      kind === 'orchestrator'
+        ? m[2].match(/\bworker="([^"]*)"/)?.[1]
+        : origin?.kind === 'peer' && typeof origin.name === 'string' && (!origin.from || origin.from === from)
+          ? origin.name
+          : undefined;
+    out.push({ kind, from, name, body: m[3].trim() });
   }
   if (!out.length) return null;
   if (raw.replace(AGENT_PREFIX_RE, '').replace(AGENT_MESSAGE_RE, '').trim()) return null;
@@ -492,6 +519,8 @@ export class ChatModel {
   private currentMsgId: string | null = null;
   private skipStream = false;
   private turn = 0;
+  /** Turnos concluídos de verdade: só sobe para um `result` novo (o `turn` acima também sobe quando o buffer repete um). */
+  private endedTurns = 0;
   private noticeSeq = 0;
   status: string | null = null;
   running = false;
@@ -519,6 +548,16 @@ export class ChatModel {
   private lastMainModel?: string;
   /** Horário da última fala do assistente no turno atual (ms), para atribuir data ao resultado caso ele não traga timestamp próprio. */
   private lastAssistantTime?: number;
+  /** Turno atual sem evento "result" explícito: acumulador para reconstruir métricas de rodapé a partir do transcript. */
+  private pendingTurn?: {
+    userAt?: number;
+    lastAssistantAt?: number;
+    lastAssistantUsage?: any;
+    lastAssistantUuid?: string;
+    accumulatedOutputTokens: number;
+    hasAssistant: boolean;
+    interrupted?: boolean;
+  };
   /** Último `/compact` enviado por esta interface e o turno em que o Claude começou a executá-lo (eco do CLI). */
   private compactUuid?: string;
   private compactStartedTurn?: number;
@@ -551,10 +590,55 @@ export class ChatModel {
     this.version++;
   }
 
+  /**
+   * Finaliza o turno anterior que ficou sem evento "result" explícito (como ocorre no histórico/transcript,
+   * que o Claude Code CLI não grava no disco). Gera o rodapé com duração, tokens e horário reais.
+   */
+  finalizePendingTurn() {
+    if (!this.pendingTurn || !this.pendingTurn.hasAssistant) {
+      this.pendingTurn = undefined;
+      return;
+    }
+    const pt = this.pendingTurn;
+    this.pendingTurn = undefined;
+    const at = pt.lastAssistantAt ?? pt.userAt;
+    const dur = pt.userAt !== undefined && at !== undefined && at >= pt.userAt ? at - pt.userAt : undefined;
+    const u = pt.lastAssistantUsage;
+    let tokens: TokenUsage | undefined;
+    if (u) {
+      const inTok = num(u.input_tokens);
+      const cacheR = num(u.cache_read_input_tokens);
+      const cacheC = num(u.cache_creation_input_tokens);
+      const outTok = pt.accumulatedOutputTokens > 0 ? pt.accumulatedOutputTokens : num(u.output_tokens);
+      if (inTok + cacheR + cacheC + outTok > 0) {
+        tokens = { input: inTok, cacheRead: cacheR, cacheCreate: cacheC, output: outTok };
+      }
+    }
+    this.turn++;
+    this.endedTurns++;
+    const key = `result:hist-${pt.lastAssistantUuid ?? this.turn}`;
+    if (this.byKey.has(key)) return;
+    const r: ResultItem = {
+      kind: 'result',
+      key,
+      subtype: pt.interrupted ? 'interrupted' : 'success',
+      isError: !!pt.interrupted,
+      durationMs: dur,
+      tokens,
+      at,
+      synthetic: true,
+    };
+    this.lastResult = r;
+    this.add(r);
+  }
+
   /** Mensagem enviada pela interface (aparece na hora, confirmada pelo eco do CLI). */
   addPendingUser(uuid: string, text: string, images: ImageData[], at = Date.now()) {
     this.lastAssistantTime = undefined;
-    this.add({ kind: 'user', key: `user:${uuid}`, uuid, text, images, pending: true, at });
+    this.finalizePendingTurn();
+    // Lido antes de marcar "trabalhando" logo abaixo: se já estava, esta mensagem chega no meio da tarefa.
+    const midTurn = this.running;
+    this.add({ kind: 'user', key: `user:${uuid}`, uuid, text, images, pending: true, at, ...(midTurn ? { midTurn: true, sentTurn: this.endedTurns } : {}) });
     this.seenUuids.add(uuid);
     if (isCompactCommand(text)) {
       this.compactUuid = uuid;
@@ -562,7 +646,41 @@ export class ChatModel {
     }
     this.noteCacheRequest(at);
     this.running = true;
+    this.pendingTurn = {
+      userAt: at,
+      accumulatedOutputTokens: 0,
+      hasAssistant: false,
+    };
     this.version++;
+  }
+
+  /**
+   * A mensagem foi enviada no meio de uma tarefa, a tarefa já acabou e você ainda não escreveu mais nada: é a que o
+   * Claude pode ter deixado sem resposta, então a interface oferece reenviá-la como mensagem nova.
+   * Não dá para saber se ele a respondeu (o CLI só diz que a entregou): por isso vale para toda mensagem desse tipo, no
+   * último turno concluído. Um turno posterior (inclusive o que o CLI abre sozinho para uma mensagem que sobrou na fila)
+   * mostra que ela andou, e some.
+   */
+  canResend(it: UserItem): boolean {
+    if (!it.midTurn || it.resent || it.failed || it.sentTurn === undefined) return false;
+    if (this.running || this.endedTurns !== it.sentTurn + 1) return false;
+    const from = this.items.indexOf(it);
+    if (from < 0) return false;
+    for (let i = from + 1; i < this.items.length; i++) {
+      const x = this.items[i];
+      // Outra mensagem sua do mesmo turno não conta; qualquer outra, depois, já retomou a conversa.
+      if (x.kind === 'user' && (!x.source || x.source === 'user') && !(x.midTurn && x.sentTurn === it.sentTurn)) return false;
+    }
+    return true;
+  }
+
+  /** Marca a mensagem como reenviada (o botão some). */
+  markResent(uuid: string) {
+    const it = this.byKey.get(`user:${uuid}`) as UserItem | undefined;
+    if (it) {
+      it.resent = true;
+      this.version++;
+    }
   }
 
   failPendingUser(uuid: string, error: string) {
@@ -682,6 +800,14 @@ export class ChatModel {
       case 'control_request':
         if (msg.request?.subtype === 'can_use_tool') this.onPermission(msg.request_id, msg.request);
         return;
+      case 'control_response': {
+        // Resposta dada pelo servidor (ex.: "Aprovar sozinho") ou por outra janela.
+        const rid = msg.response?.request_id;
+        const b = msg.response?.response?.behavior;
+        if (rid && this.pendingPermissions.has(rid) && (b === 'allow' || b === 'deny'))
+          this.answered(rid, b === 'allow' ? 'allowed' : 'denied');
+        return;
+      }
       case 'control_cancel_request': {
         const t = this.pendingPermissions.get(msg.request_id);
         if (t?.permission) t.permission.status = 'cancelled';
@@ -818,6 +944,25 @@ export class ChatModel {
       const used = usedTokensOf(m.usage);
       if (used > 0) this.contextUsage = { ...this.contextUsage, usedTokens: used };
     }
+    if (!parentId) {
+      if (!this.pendingTurn) {
+        this.pendingTurn = {
+          userAt: undefined,
+          lastAssistantAt: undefined,
+          lastAssistantUsage: undefined,
+          lastAssistantUuid: undefined,
+          accumulatedOutputTokens: 0,
+          hasAssistant: false,
+        };
+      }
+      this.pendingTurn.hasAssistant = true;
+      this.pendingTurn.lastAssistantAt = astTime;
+      this.pendingTurn.lastAssistantUuid = msg.uuid || m.id;
+      if (m.usage) {
+        this.pendingTurn.lastAssistantUsage = m.usage;
+        this.pendingTurn.accumulatedOutputTokens += num(m.usage.output_tokens);
+      }
+    }
     const msgId: string = m.id ?? `m${Math.random()}`;
     this.seenAssistant.add(msgId);
     const lineUuid: string | undefined = typeof msg.uuid === 'string' && msg.uuid ? msg.uuid : undefined;
@@ -908,6 +1053,9 @@ export class ChatModel {
         pending.pending = false;
         pending.at ??= msgTime(msg);
         if (uuid === this.compactUuid) this.compactStartedTurn = this.turn;
+        // Enviada no meio de uma tarefa, mas o eco só chegou depois do fim dela: o CLI abriu um turno novo para essa
+        // mensagem que sobrou na fila. Já está trabalhando (antes do primeiro evento de streaming) e não há o que reenviar.
+        if (!opts.history && pending.midTurn && pending.sentTurn !== undefined && this.endedTurns > pending.sentTurn) this.running = true;
         return;
       }
       if (this.seenUuids.has(uuid)) return;
@@ -965,6 +1113,7 @@ export class ChatModel {
     if (isSyntheticBreadcrumb(msg)) return;
     let { text, images, command } = visibleUserText(content);
     if (/^\[Request interrupted by user/i.test(text)) {
+      if (this.pendingTurn) this.pendingTurn.interrupted = true;
       this.endTurnTools(true);
       this.notice('info', 'Interrompido pelo usuário.');
       return;
@@ -1008,11 +1157,30 @@ export class ChatModel {
       }
     }
 
+    if (source === 'user') {
+      this.finalizePendingTurn();
+      this.pendingTurn = {
+        userAt: msgTime(msg),
+        accumulatedOutputTokens: 0,
+        hasAssistant: false,
+      };
+    }
+
     this.add({ kind: 'user', key: uuid ? `user:${uuid}` : `user:h${this.items.length}`, uuid, text, images, source, skillName, taskNotification, agentMessages, at: msgTime(msg) });
     if (!opts.history && msg.isReplay) this.running = true;
   }
 
   private onResult(msg: any, opts: { history?: boolean; replay?: boolean } = {}) {
+    this.pendingTurn = undefined;
+    // Se o último item era um resultado sintético (reconstruído do histórico antes do snapshot),
+    // remove para substituir pelo resultado real do CLI com custos e métricas exatas.
+    if (this.lastResult?.synthetic) {
+      const idx = this.items.indexOf(this.lastResult);
+      if (idx >= 0) {
+        this.byKey.delete(this.lastResult.key);
+        this.items.splice(idx, 1);
+      }
+    }
     this.turn++;
     this.running = false;
     this.status = null;
@@ -1035,6 +1203,7 @@ export class ChatModel {
       at,
     };
     if (this.byKey.has(r.key)) return;
+    this.endedTurns++;
     // Janela do modelo principal (o resultado traz um item por modelo da sessão). Sem casar, mantém a que já sabia.
     const win = windowFromModelUsage(msg.modelUsage, [this.lastMainModel, this.initModel]);
     if (win) this.contextUsage = { ...this.contextUsage, ...win };
@@ -1191,6 +1360,12 @@ export class ChatModel {
       this.status = null;
       this.endTurnTools(true);
       this.notice('info', 'O processo desta conversa não está mais rodando no servidor (reinício ou limpeza). A próxima mensagem retoma de onde parou.');
+    } else if (msg.event === 'auto_resume') {
+      // O processo foi morto à força (137) no meio da tarefa e a retomada automática está ligada.
+      const secs = Math.max(1, Math.round((Number(msg.delayMs) || 0) / 1000));
+      this.notice('info', `Retomando sozinho em ${secs} s (tentativa ${msg.attempt} de ${msg.max}).`);
+    } else if (msg.event === 'auto_resume_gave_up') {
+      this.notice('warn', `Parei de retomar sozinho depois de ${msg.attempts} quedas seguidas. Envie uma mensagem para continuar.`);
     } else if (msg.event === 'interrupted_before_start') {
       // Parado antes de o Claude receber a mensagem: ela não foi enviada e não roda depois.
       this.running = false;

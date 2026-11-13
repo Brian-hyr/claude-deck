@@ -160,4 +160,41 @@ describe('markdown-copy', () => {
       expect(removeAllRangesMock).toHaveBeenCalled();
     });
   });
+
+  describe('LaTeX math rendering', () => {
+    it('renderiza blocos matemáticos $$...$$ e fórmulas inline $...$', () => {
+      const el = mount(
+        <Markdown text={'Fórmula de Euler: $$e^{i\\pi} + 1 = 0$$\nE inline $E = mc^2$ no texto.'} />
+      );
+
+      const block = el.querySelector('.md-math-block');
+      expect(block).toBeTruthy();
+      expect(block?.getAttribute('data-tex')).toBe('e^{i\\pi} + 1 = 0');
+      expect(block?.textContent).toContain('π');
+
+      const inline = el.querySelector('.md-math-inline');
+      expect(inline).toBeTruthy();
+      expect(inline?.getAttribute('data-tex')).toBe('E = mc^2');
+    });
+
+    it('não confunde preços como $50 ou $100 com fórmulas LaTeX', () => {
+      const el = mount(
+        <Markdown text="O valor é $50 ou $100 dólares." />
+      );
+
+      const inline = el.querySelector('.md-math-inline');
+      expect(inline).toBeNull();
+      expect(el.textContent).toContain('$50');
+      expect(el.textContent).toContain('$100');
+    });
+
+    it('não quebra blocos de código com $ dentro', () => {
+      const code = '```bash\necho $VAR\n```';
+      const el = mount(<Markdown text={code} />);
+
+      const inline = el.querySelector('.md-math-inline');
+      expect(inline).toBeNull();
+      expect(el.querySelector('pre code')?.textContent).toContain('echo $VAR');
+    });
+  });
 });

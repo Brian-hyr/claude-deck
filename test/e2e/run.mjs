@@ -1272,7 +1272,7 @@ await step('JSON em árvore (busca, expandir, copiar caminho)', async () => {
   await waitActiveFile('config.json');
   await waitText('.json-view .jkey', '"servidores"');
   await shot('visualizador-json');
-  await page.type('.json-tools input', 'ia-manager');
+  await page.type('.json-tools input', 'srv-linux-2');
   await waitFor(() => document.querySelectorAll('.json-view .jrow.hit').length >= 1, 5000, 'resultado da busca');
   await waitText('.json-tools', 'resultado');
   await shot('visualizador-json-busca');
@@ -1281,15 +1281,16 @@ await step('JSON em árvore (busca, expandir, copiar caminho)', async () => {
   await (await row.$('.jcopy button[title="Copiar caminho"]')).click();
   await waitText('.toast', 'Caminho copiado');
   const clip = await page.evaluate(() => navigator.clipboard.readText()).catch(() => null);
-  if (clip !== null) assert(/^\$\.servidores\[1\]\.(alias|pastas\[0\])$/.test(clip), `caminho copiado inesperado: ${clip}`);
+  if (clip !== null) assert(/^\$\.servidores\[1\]\.alias$/.test(clip), `caminho copiado inesperado: ${clip}`);
   await page.click('.json-tools input', { clickCount: 3 });
   await page.keyboard.press('Backspace');
   const before = await count('.json-view .jrow');
   await clickText('.json-tools .btn', 'Expandir');
   await waitFor((n) => document.querySelectorAll('.json-view .jrow').length > n, 5000, 'expandir tudo', before);
   await clickText('.json-tools .btn', 'Recolher');
-  // Recolher deixa só o primeiro nível: raiz + 8 chaves + fechamento.
-  await waitFor(() => document.querySelectorAll('.json-view .jrow').length === 10, 5000, 'recolher tudo');
+  // Recolher deixa só o primeiro nível: raiz + uma linha por chave de topo + fechamento (lido da própria fixture).
+  const topKeys = Object.keys(JSON.parse(fs.readFileSync(path.join(SANDBOX_SRC, 'data', 'config.json'), 'utf8'))).length;
+  await waitFor((n) => document.querySelectorAll('.json-view .jrow').length === n, 5000, `recolher tudo (${topKeys + 2} linhas)`, topKeys + 2);
   await waitFor(() => document.querySelector('.json-tools input')?.value === '', 3000, 'busca limpa');
 });
 

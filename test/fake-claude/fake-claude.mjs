@@ -2,10 +2,12 @@
 // "Claude falso" para testes: fala o protocolo stream-json do Claude Code (initialize, mensagens
 // parciais, ferramentas, pedidos de permissão, interrupção) e grava um transcript como o real.
 // Comandos (texto da mensagem): echo <x> | write <arquivo> | edit <arquivo> | bash | ask | deep | plan |
-// todo | slow | slowfx | image | agentmsg [texto] | bgagent [n] | agentdone | compactsim | ctx <tokens> | crash | long | markdown | term <comando> | termkeys <tecla,...> | termread | termtools
+// todo | slow | slowfx | ignoremid [n] | image | agentmsg [texto] | bgagent [n] | agentdone | compactsim | ctx <tokens> | crash | kill137 | kill137later | long | markdown | term <comando> | termkeys <tecla,...> | termread | termtools
 // ("deep" = raciocínio + leitura de arquivo e só então a pergunta, como uma cadeia de trabalho real)
 // ("term" = usa a ferramenta do terminal ao vivo do app — servidor MCP "sdk" pelo canal de controle,
 //  como o CLI de verdade: handshake initialize/tools/list e tools/call via "mcp_message")
+// ("mcp <servidor> <ferramenta> <json>" = chama qualquer ferramenta de um servidor MCP do app e responde com o
+//  resultado; "mcpinfo" = lista ferramentas e o começo das instruções de cada servidor)
 import readline from 'node:readline';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -28,6 +30,7 @@ const projDir = path.join(claudeDir, 'projects', cwd.replace(/[^a-zA-Z0-9]/g, '-
 fs.mkdirSync(projDir, { recursive: true });
 const transcript = path.join(projDir, `${sessionId}.jsonl`);
 let lastUuid = null;
+let autoDecided = false;
 
 const out = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 /**
@@ -63,7 +66,11 @@ let sdkServers = [];
 let mcpReady = null;
 let mcpTools = [];
 let mcpInstructions = '';
+/** Por servidor: ferramentas (nomes curtos) e instruções do initialize. */
+const mcpByServer = {};
 let rpcSeq = 0;
+/** Último texto do assistente no turno (vai no campo `result`, como no CLI de verdade). */
+let lastText = '';
 
 /** Manda uma mensagem JSON-RPC para um servidor MCP do app e espera a resposta (mcp_response). */
 function mcpCall(server, method, params) {
@@ -75,17 +82,19 @@ function mcpCall(server, method, params) {
   });
 }
 
-/** Handshake como o CLI: initialize + notifications/initialized + tools/list. */
+/** Handshake como o CLI, com cada servidor anunciado: initialize + notifications/initialized + tools/list. */
 async function mcpHandshake() {
-  const server = sdkServers[0];
-  if (!server) return;
-  const init = await mcpCall(server, 'initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'fake-claude', version: '9.9.9' } });
-  mcpInstructions = init.result?.instructions ?? '';
-  // Notificação (sem id): o app responde com um vazio.
-  const nid = `fake-mcp-${++reqSeq}`;
-  out({ type: 'control_request', request_id: nid, request: { subtype: 'mcp_message', server_name: server, message: { jsonrpc: '2.0', method: 'notifications/initialized' } } });
-  const list = await mcpCall(server, 'tools/list', {});
-  mcpTools = (list.result?.tools ?? []).map((t) => `mcp__${server}__${t.name}`);
+  for (const server of sdkServers) {
+    const init = await mcpCall(server, 'initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'fake-claude', version: '9.9.9' } });
+    // Notificação (sem id): o app responde com um vazio.
+    const nid = `fake-mcp-${++reqSeq}`;
+    out({ type: 'control_request', request_id: nid, request: { subtype: 'mcp_message', server_name: server, message: { jsonrpc: '2.0', method: 'notifications/initialized' } } });
+    const list = await mcpCall(server, 'tools/list', {});
+    const names = (list.result?.tools ?? []).map((t) => t.name);
+    mcpByServer[server] = { tools: names, instructions: init.result?.instructions ?? '' };
+    mcpTools.push(...names.map((n) => `mcp__${server}__${n}`));
+    if (server === 'deck_terminal') mcpInstructions = init.result?.instructions ?? '';
+  }
 }
 
 function init() {
@@ -118,6 +127,8 @@ function assistant(msgId, content) {
   const m = { type: 'assistant', message: { id: msgId, type: 'message', role: 'assistant', model, content, stop_reason: null, usage: callUsage() }, parent_tool_use_id: null, session_id: sessionId, uuid: crypto.randomUUID() };
   out(m);
   record(m);
+  const t = content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
+  if (t) lastText = t;
 }
 
 function toolResult(toolUseId, content, isError = false, structured) {
@@ -129,7 +140,7 @@ function toolResult(toolUseId, content, isError = false, structured) {
 let totalCostUsd = 0;
 function result(subtype = 'success', start = Date.now()) {
   totalCostUsd += 0.0012;
-  out({ type: 'result', subtype, is_error: subtype !== 'success', duration_ms: Date.now() - start, duration_api_ms: 10, num_turns: 1, session_id: sessionId, total_cost_usd: totalCostUsd, usage: { input_tokens: 271, cache_creation_input_tokens: 0, cache_read_input_tokens: 25088, output_tokens: 6 }, modelUsage: { [model]: { inputTokens: 25613, outputTokens: 27, cacheReadInputTokens: 25088, cacheCreationInputTokens: 0, costUSD: totalCostUsd, ...(ctxWindow ? { contextWindow: ctxWindow, maxOutputTokens: 4000 } : {}) } }, permission_denials: [], uuid: crypto.randomUUID(), timestamp: new Date().toISOString() });
+  out({ type: 'result', subtype, is_error: subtype !== 'success', result: lastText, duration_ms: Date.now() - start, duration_api_ms: 10, num_turns: 1, session_id: sessionId, total_cost_usd: totalCostUsd, usage: { input_tokens: 271, cache_creation_input_tokens: 0, cache_read_input_tokens: 25088, output_tokens: 6 }, modelUsage: { [model]: { inputTokens: 25613, outputTokens: 27, cacheReadInputTokens: 25088, cacheCreationInputTokens: 0, costUSD: totalCostUsd, ...(ctxWindow ? { contextWindow: ctxWindow, maxOutputTokens: 4000 } : {}) } }, permission_denials: [], uuid: crypto.randomUUID(), timestamp: new Date().toISOString() });
 }
 
 async function runTool(msgId, name, input, run) {
@@ -169,34 +180,102 @@ function applyPerms(list) {
 async function handleUser(msg) {
   busy = true;
   interrupted = false;
+  lastText = '';
   const start = Date.now();
   const fullText = msg.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
   // Guarda os avisos do app (system-reminder) para os testes conferirem o que o Claude recebeu.
   for (const m of fullText.matchAll(/<system-reminder>([\s\S]*?)<\/system-reminder>/g)) reminders.push(m[1].trim());
-  const text = fullText.replace(/<[^>]+>[\s\S]*?<\/[^>]+>\n?/g, '').trim();
+  // Briefing/mensagem do orquestrador: uma linha "fake-cmd: <comando>" dentro dela vira o comando deste turno
+  // (é assim que os testes fazem um worker falso trabalhar devagar ou mandar o relatório sozinho).
+  const orqCmd = fullText.match(/<orchestrator-message\b[^>]*>[\s\S]*?^fake-cmd:[ \t]*(.+)$[\s\S]*?<\/orchestrator-message>/m)?.[1];
+  const text = orqCmd ? orqCmd.trim() : fullText.replace(/<[^>]+>[\s\S]*?<\/[^>]+>\n?/g, '').trim();
   const images = msg.message.content.filter((b) => b.type === 'image').length;
   const uuid = msg.uuid || crypto.randomUUID();
   const replay = { type: 'user', message: msg.message, session_id: sessionId, parent_tool_use_id: null, uuid, isReplay: true };
+  // O CLI de verdade anuncia o "init" de novo a cada pedido, sempre com o modelo pedido (no modo automático, o automático).
+  if (text.split(/\s+/)[0] === 'reinit') init();
   out(replay);
   record({ type: 'user', message: msg.message, uuid });
+  // Modo automático: o hook do gateway decide no 1º pedido e deixa o aviso só no transcript (não sai no stream-json).
+  if (/^auto(\[|$)/i.test(model) && !autoDecided) {
+    autoDecided = true;
+    record({ type: 'attachment', uuid: crypto.randomUUID(), attachment: { type: 'hook_additional_context', hookName: 'UserPromptSubmit', hookEvent: 'UserPromptSubmit', content: ['Sessão no modo Automático: o gateway escolheu Fake Opus medium (nível 3 – médio, esforço medium) para esta conversa inteira.'] } });
+  }
   out({ type: 'system', subtype: 'status', status: 'requesting', session_id: sessionId, uuid: crypto.randomUUID() });
   const msgId = `msg_${crypto.randomBytes(6).toString('hex')}`;
   out({ type: 'stream_event', event: { type: 'message_start', message: { id: msgId, type: 'message', role: 'assistant', content: [], model } }, session_id: sessionId, parent_tool_use_id: null, uuid: crypto.randomUUID() });
   const [cmd, ...rest] = text.split(/\s+/);
   const arg = rest.join(' ');
+  // Erro da API como o CLI 2.1.x entrega (mensagem sintética + result com terminal_reason "api_error"):
+  //   "apierr <status> <texto>" num turno; ou o modelo atual em FAKE_EXHAUSTED_MODELS (lista separada por vírgula),
+  //   que simula um modelo esgotado no gateway (LiteLLM: 429 "No deployments available") em todo turno.
+  const baseModel = model.replace(/\[1m\]$/i, '');
+  const exhausted = (process.env.FAKE_EXHAUSTED_MODELS || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const apiFail =
+    cmd === 'apierr'
+      ? { status: Number(rest[0]) || 500, error: 'unknown', text: rest.slice(1).join(' ') || 'erro' }
+      : exhausted.includes(baseModel)
+        ? { status: 429, error: 'rate_limit', text: `Request rejected (429) · No deployments available for selected model, Try again in 600 seconds. Passed model=${baseModel}. pre-call-checks=False` }
+        : null;
+  if (apiFail) {
+    const text = `API Error: ${apiFail.text}`;
+    const a = { type: 'assistant', message: { id: msgId, type: 'message', role: 'assistant', model: '<synthetic>', content: [{ type: 'text', text }], stop_reason: 'stop_sequence', usage: { input_tokens: 0, output_tokens: 0 } }, parent_tool_use_id: null, session_id: sessionId, uuid: crypto.randomUUID(), error: apiFail.error, is_api_error_message: true, api_error_status: apiFail.status };
+    out(a);
+    record({ ...a, isApiErrorMessage: true });
+    out({ type: 'result', subtype: 'success', is_error: true, terminal_reason: 'api_error', api_error_status: apiFail.status, result: text, duration_ms: Date.now() - start, duration_api_ms: 0, num_turns: 1, session_id: sessionId, total_cost_usd: totalCostUsd, usage: { input_tokens: 0, output_tokens: 0 }, modelUsage: {}, permission_denials: [], uuid: crypto.randomUUID(), timestamp: new Date().toISOString() });
+    busy = false;
+    if (queue.length) handleUser(queue.shift());
+    return;
+  }
   try {
     if (cmd === 'crash') process.exit(3);
+    // Morto à força no meio do turno (SIGKILL de um monitor/OOM): o shell do runner vê o código 137.
+    if (cmd === 'kill137') process.exit(137);
+    // Responde normalmente e só depois é morto, já parado entre tarefas (a retomada automática não deve agir).
+    if (cmd === 'kill137later') setTimeout(() => process.exit(137), 3000);
     if (cmd === 'ctx') {
       // "ctx 60000": as próximas chamadas ao modelo passam a informar esse tanto de contexto em uso.
       ctxUsed = Number(arg) || 0;
       assistant(msgId, [{ type: 'text', text: `contexto simulado: ${ctxUsed}` }]);
+    } else if (cmd === 'mcpinfo') {
+      await mcpReady;
+      const info = Object.fromEntries(Object.entries(mcpByServer).map(([k, v]) => [k, { tools: v.tools, instructions: v.instructions.slice(0, 200) }]));
+      assistant(msgId, [{ type: 'text', text: `mcpinfo ${JSON.stringify(info)}` }]);
+    } else if (cmd === 'mcp') {
+      // "mcp deck_orq worker_start {json}": chama a ferramenta pelo canal de controle e responde com o resultado.
+      await mcpReady;
+      const m = arg.match(/^(\S+)\s+(\S+)\s*([\s\S]*)$/);
+      let server = m?.[1];
+      const tool = m?.[2];
+      let input = {};
+      try {
+        input = m?.[3]?.trim() ? JSON.parse(m[3]) : {};
+      } catch (e) {
+        assistant(msgId, [{ type: 'text', text: `JSON inválido: ${e}` }]);
+        server = undefined;
+      }
+      if (server && tool && mcpByServer[server]?.tools.includes(tool)) {
+        let resultText = '';
+        let resultError = false;
+        const r = await runTool(msgId, `mcp__${server}__${tool}`, input, async (inp) => {
+          const resp = await mcpCall(server, 'tools/call', { name: tool, arguments: inp });
+          const res = resp.result ?? {};
+          resultText = (res.content ?? []).map((c) => c.text).join('\n') || JSON.stringify(resp.error ?? {});
+          resultError = !!res.isError || !!resp.error;
+          return { text: resultText, error: resultError };
+        });
+        if (!interrupted && !r?.interrupt) assistant(msgId + 'b', [{ type: 'text', text: r?.denied ? 'Ferramenta negada.' : `${resultError ? 'ERRO ' : 'OK '}${tool}: ${resultText}` }]);
+      } else if (server) {
+        assistant(msgId, [{ type: 'text', text: `ferramenta indisponível: ${server}/${tool}` }]);
+      }
     } else if (['term', 'termkeys', 'termread', 'termtools', 'reminders'].includes(cmd)) {
       await mcpReady;
-      const server = sdkServers[0];
+      const server = sdkServers.includes('deck_terminal') ? 'deck_terminal' : undefined;
       if (cmd === 'termtools' || cmd === 'reminders') {
-        const reply = cmd === 'termtools' ? `ferramentas: ${mcpTools.join(', ') || '(nenhuma)'} | instruções: ${mcpInstructions ? 'sim' : 'não'}` : `avisos: ${JSON.stringify(reminders)}`;
+        const termTools = mcpTools.filter((t) => t.startsWith('mcp__deck_terminal__'));
+        const reply = cmd === 'termtools' ? `ferramentas: ${termTools.join(', ') || '(nenhuma)'} | instruções: ${mcpInstructions ? 'sim' : 'não'}` : `avisos: ${JSON.stringify(reminders)}`;
         assistant(msgId, [{ type: 'text', text: reply }]);
-      } else if (!server || !mcpTools.length) {
+      } else if (!server || !mcpByServer[server]?.tools.length) {
         assistant(msgId, [{ type: 'text', text: 'sem ferramentas do terminal ao vivo' }]);
       } else {
         const tool = cmd === 'term' ? 'run' : cmd === 'termkeys' ? 'send' : 'read';
@@ -208,7 +287,7 @@ async function handleUser(msg) {
         });
         if (!interrupted && !r?.interrupt) assistant(msgId + 'b', [{ type: 'text', text: r?.denied ? 'Terminal negado.' : 'Terminal usado.' }]);
       }
-    } else if (cmd === 'echo' || cmd === 'markdown' || cmd === 'long' || !['write', 'edit', 'bash', 'bashfail', 'ask', 'askmulti', 'deep', 'plan', 'todo', 'slow', 'image', 'slowfx', 'agentmsg', 'agentperm', 'bgagent', 'agentdone', 'compactsim'].includes(cmd)) {
+    } else if (cmd === 'echo' || cmd === 'markdown' || cmd === 'long' || !['write', 'edit', 'bash', 'bashfail', 'ask', 'askmulti', 'deep', 'plan', 'todo', 'slow', 'image', 'slowfx', 'agentmsg', 'agentperm', 'bgagent', 'agentdone', 'compactsim', 'ignoremid'].includes(cmd)) {
       let reply = cmd === 'effort' ? `esforço=${effort} sessão=${sessionId}` : cmd === 'echo' ? arg : cmd === 'markdown' ? '# Título\n\nTexto com **negrito**, `src/app.ts:12` e lista:\n\n- um\n- dois\n\n```ts\nconst x: number = 1;\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |' : cmd === 'long' ? Array.from({ length: 200 }, (_, i) => `Linha ${i + 1} do texto longo.`).join('\n\n') : `Recebi: ${text}${images ? ` (+${images} imagem)` : ''} [modo=${mode}]`;
       await streamText(msgId, 0, reply, cmd === 'long' ? 1 : 15);
       assistant(msgId, [{ type: 'text', text: reply }]);
@@ -348,6 +427,18 @@ async function handleUser(msg) {
       record({ ...s, isCompactSummary: true, isVisibleInTranscriptOnly: true });
       ctxUsed = Math.min(ctxUsed, 4000); // depois de compactar sobra o resumo
       assistant(msgId, [{ type: 'text', text: 'Continuando depois da compactação.' }]);
+    } else if (cmd === 'ignoremid') {
+      // "ignoremid 30": trabalha 3 s. O que o usuário mandar nesse meio-tempo o CLI entrega ao modelo (o eco aparece no fluxo,
+      // como no CLI real), mas o modelo o ignora e termina a tarefa sem responder a isso (visto em transcripts reais).
+      const n = Math.min(Math.max(parseInt(arg, 10) || 30, 1), 600);
+      for (let i = 0; i < n && !interrupted; i++) await sleep(100);
+      while (queue.length) {
+        const q = queue.shift();
+        const qid = q.uuid || crypto.randomUUID();
+        out({ type: 'user', message: q.message, session_id: sessionId, parent_tool_use_id: null, uuid: qid, isReplay: true });
+        record({ type: 'user', message: q.message, uuid: qid });
+      }
+      assistant(msgId, [{ type: 'text', text: 'Terminei a tarefa.' }]);
     } else if (cmd === 'image') {
       const png = 'iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4z8CAFWEXHbQSACj/P8Fu7N9hAAAAAElFTkSuQmCC';
       await runTool(msgId, 'Read', { file_path: path.join(cwd, 'img.png') }, () => ({ text: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: png } }] }));
@@ -383,7 +474,7 @@ rl.on('line', (line) => {
         sdkServers = r.sdkMcpServers;
         mcpReady = mcpHandshake().catch((e) => process.stderr.write(`handshake MCP falhou: ${e}\n`));
       }
-      out({ type: 'control_response', response: { subtype: 'success', request_id: m.request_id, response: { commands: [{ name: 'fake-cmd', description: 'Comando falso de teste', argumentHint: '' }, { name: 'compact', description: 'Compactar' }], agents: [], models: [{ value: 'default', displayName: 'Padrão', description: '' }, { value: 'fake-opus', displayName: 'Fake Opus', description: '' }, { value: 'fake-sonnet', displayName: 'Fake Sonnet', description: '' }], account: { apiProvider: 'firstParty' }, current_permission_mode: mode, pending_permission_requests: [] } } });
+      out({ type: 'control_response', response: { subtype: 'success', request_id: m.request_id, response: { commands: [{ name: 'fake-cmd', description: 'Comando falso de teste', argumentHint: '' }, { name: 'compact', description: 'Compactar' }], agents: [], models: [{ value: 'default', displayName: 'Padrão', description: '' }, { value: 'fake-opus', displayName: 'Fake Opus', description: '' }, { value: 'fake-sonnet', displayName: 'Fake Sonnet', description: '' }, { value: 'fake-haiku', displayName: 'Fake Haiku', description: '' }], account: { apiProvider: 'firstParty' }, current_permission_mode: mode, pending_permission_requests: [] } } });
       if (!initialized) {
         initialized = true;
         // Como o CLI: o init sai depois de os servidores MCP conectarem.

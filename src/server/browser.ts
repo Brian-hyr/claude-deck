@@ -5,7 +5,7 @@ import path from 'node:path';
 import { execFile, spawn } from 'node:child_process';
 import { DeckError } from '../shared/protocol';
 import { encodeOpen, type OpenTarget } from '../shared/openwin';
-import type { BrowserId } from '../shared/types';
+import type { BrowserId, WindowBounds } from '../shared/types';
 
 /** Mantém a busca histórica do Brave para quem já usa o Deck. */
 export function findBrave(env: NodeJS.ProcessEnv = process.env, exists: (p: string) => boolean = fs.existsSync): string | null {
@@ -387,6 +387,347 @@ export async function focusWindow(
       });
     } catch {
       resolve(false);
+    }
+  });
+}
+
+// ------------------------------------------------------------------ posição das janelas (Windows)
+//
+// A página não serve para isso: dentro de uma janela --app, `window.moveTo` não passa de um monitor para
+// outro (fica preso no monitor atual), `screenX`/`outerWidth` vêm em DIPs (errados com escalas diferentes
+// por monitor) e o Chromium já aberto ignora --window-position/--window-size de um lançamento novo.
+// Então o servidor lê e aplica a posição pelo Win32, em pixels físicos (DPI por monitor), achando a janela
+// pela marca temporária no título (como o foco) e conferindo que é o navegador do perfil do Deck.
+
+/** Uma operação sobre uma janela: achar pelo `hwnd` já conhecido e/ou pela `marker`; com `apply`, reposiciona antes de ler. */
+export interface PlacementJob {
+  marker?: string;
+  hwnd?: number;
+  apply?: WindowBounds;
+}
+
+export interface PlacementResult {
+  hwnd: number;
+  /** Posição lida depois da operação. */
+  placement: WindowBounds;
+  /** Resultado do `apply`: OK, PART (tamanho não ficou exato), OFF (fora de qualquer monitor), BAD, ou '-' sem apply. */
+  result: string;
+}
+
+const MIN_W = 200;
+const MIN_H = 150;
+const MAX_COORD = 100_000;
+
+/** Aceita só uma posição plausível (inteiros, tamanho mínimo); qualquer outra coisa vira `undefined`. */
+export function validPlacement(v: unknown): WindowBounds | undefined {
+  if (!v || typeof v !== 'object') return undefined;
+  const o = v as Record<string, unknown>;
+  const nums = [o.x, o.y, o.width, o.height];
+  if (!nums.every((n) => typeof n === 'number' && Number.isFinite(n))) return undefined;
+  const [x, y, width, height] = (nums as number[]).map((n) => Math.round(n));
+  if (Math.abs(x) > MAX_COORD || Math.abs(y) > MAX_COORD) return undefined;
+  if (width < MIN_W || height < MIN_H || width > MAX_COORD || height > MAX_COORD) return undefined;
+  return o.maximized === true ? { x, y, width, height, maximized: true } : { x, y, width, height };
+}
+
+/** Lê a saída do script: uma linha `R <i> <hwnd> <x> <y> <w> <h> <max> <result>` ou `R <i> MISS` por operação. */
+export function parsePlacementOutput(stdout: string, count: number): (PlacementResult | null)[] {
+  const out: (PlacementResult | null)[] = Array.from({ length: count }, () => null);
+  for (const raw of String(stdout ?? '').split(/\r?\n/)) {
+    const parts = raw.trim().split(/\s+/);
+    if (parts[0] !== 'R' || parts.length < 9) continue;
+    const i = Number(parts[1]);
+    if (!Number.isInteger(i) || i < 0 || i >= count) continue;
+    const hwnd = Number(parts[2]);
+    if (!Number.isSafeInteger(hwnd) || hwnd <= 0) continue;
+    const placement = validPlacement({
+      x: Number(parts[3]),
+      y: Number(parts[4]),
+      width: Number(parts[5]),
+      height: Number(parts[6]),
+      maximized: parts[7] === '1',
+    });
+    if (!placement) continue;
+    out[i] = { hwnd, placement, result: parts[8] };
+  }
+  return out;
+}
+
+/**
+ * C# que lê e aplica a posição. Trabalha com DPI por monitor (v2) na própria thread, para tudo sair em
+ * pixels físicos. Mesma regra de `focusHelperSource`: só `ShowWindowAsync`, nunca `ShowWindow` síncrono.
+ */
+export function placementHelperSource(): string {
+  return `using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+
+public class DeckWinPlacement {
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT { public int X; public int Y; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct WINDOWPLACEMENT {
+        public int length;
+        public int flags;
+        public int showCmd;
+        public POINT ptMinPosition;
+        public POINT ptMaxPosition;
+        public RECT rcNormalPosition;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MONITORINFO { public int cbSize; public RECT rcMonitor; public RECT rcWork; public uint dwFlags; }
+
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
+    [DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT wp);
+    [DllImport("user32.dll")] public static extern IntPtr MonitorFromRect(ref RECT r, uint flags);
+    [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO mi);
+    [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
+
+    public struct WindowMatch { public IntPtr Handle; public uint ProcessId; }
+
+    public static void PerMonitorDpi() {
+        try { SetThreadDpiAwarenessContext(new IntPtr(-4)); } catch {}
+    }
+
+    public static List<WindowMatch> FindWindows(string marker) {
+        var list = new List<WindowMatch>();
+        EnumWindows((hWnd, lParam) => {
+            var sb = new StringBuilder(1024);
+            if (GetWindowText(hWnd, sb, 1024) > 0 && sb.ToString().IndexOf(marker, StringComparison.Ordinal) >= 0) {
+                uint pid;
+                GetWindowThreadProcessId(hWnd, out pid);
+                list.Add(new WindowMatch { Handle = hWnd, ProcessId = pid });
+            }
+            return true;
+        }, IntPtr.Zero);
+        return list;
+    }
+
+    // Janela já conhecida (hwnd guardado): ainda existe e ainda é uma janela do Deck?
+    public static uint DeckProcessOf(IntPtr hWnd) {
+        if (hWnd == IntPtr.Zero || !IsWindow(hWnd)) return 0;
+        var sb = new StringBuilder(1024);
+        GetWindowText(hWnd, sb, 1024);
+        if (!sb.ToString().EndsWith("Claude Deck", StringComparison.Ordinal)) return 0;
+        uint pid;
+        GetWindowThreadProcessId(hWnd, out pid);
+        return pid;
+    }
+
+    static RECT Monitor(RECT r, uint flags, out bool found, out RECT work) {
+        var mi = new MONITORINFO();
+        mi.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
+        IntPtr mon = MonitorFromRect(ref r, flags);
+        found = mon != IntPtr.Zero && GetMonitorInfo(mon, ref mi);
+        work = mi.rcWork;
+        return mi.rcMonitor;
+    }
+
+    // rcNormalPosition vem em coordenadas de área de trabalho: deslocadas pela barra de tarefas no topo/esquerda.
+    static RECT ToScreen(RECT r) {
+        bool found; RECT work;
+        RECT mon = Monitor(r, 2, out found, out work);
+        if (!found) return r;
+        int dx = work.Left - mon.Left, dy = work.Top - mon.Top;
+        r.Left += dx; r.Right += dx; r.Top += dy; r.Bottom += dy;
+        return r;
+    }
+
+    // "x y largura altura max": com a janela maximizada ou minimizada, o retângulo para onde ela volta.
+    public static string Read(IntPtr hWnd) {
+        PerMonitorDpi();
+        RECT r;
+        bool max = false;
+        if (IsIconic(hWnd) || IsZoomed(hWnd)) {
+            var wp = new WINDOWPLACEMENT();
+            wp.length = Marshal.SizeOf(typeof(WINDOWPLACEMENT));
+            if (!GetWindowPlacement(hWnd, ref wp)) return null;
+            r = ToScreen(wp.rcNormalPosition);
+            max = IsZoomed(hWnd) || (wp.flags & 2) != 0; // WPF_RESTORETOMAXIMIZED
+        } else if (!GetWindowRect(hWnd, out r)) {
+            return null;
+        }
+        return r.Left + " " + r.Top + " " + (r.Right - r.Left) + " " + (r.Bottom - r.Top) + " " + (max ? 1 : 0);
+    }
+
+    static bool Exact(IntPtr hWnd, int x, int y, int w, int h) {
+        RECT c;
+        return GetWindowRect(hWnd, out c) && c.Left == x && c.Top == y && c.Right - c.Left == w && c.Bottom - c.Top == h;
+    }
+
+    public static string Apply(IntPtr hWnd, int x, int y, int w, int h, bool maximized) {
+        PerMonitorDpi();
+        if (w < ${MIN_W} || h < ${MIN_H}) return "BAD";
+        // Só se o lugar ainda existe (monitor desligado/rearranjado: deixa onde o navegador abriu).
+        var t = new RECT { Left = x, Top = y, Right = x + w, Bottom = y + h };
+        bool found; RECT work;
+        Monitor(t, 0, out found, out work);
+        if (!found) return "OFF";
+        int ix = Math.Min(t.Right, work.Right) - Math.Max(t.Left, work.Left);
+        int iy = Math.Min(t.Bottom, work.Bottom) - Math.Max(t.Top, work.Top);
+        if (ix < 120 || iy < 60) return "OFF";
+        // Barra de título fora da tela não dá para arrastar: traz o topo para dentro.
+        if (y < work.Top - 16) y = work.Top;
+        if (y > work.Bottom - 40) return "OFF";
+
+        if (IsIconic(hWnd) || IsZoomed(hWnd)) {
+            ShowWindowAsync(hWnd, 9); // SW_RESTORE
+            for (int i = 0; i < 50 && (IsIconic(hWnd) || IsZoomed(hWnd)); i++) Thread.Sleep(20);
+        }
+        // Passar para um monitor de outra escala faz o navegador reescalar o tamanho (WM_DPICHANGED):
+        // repete já no monitor novo até o retângulo ficar exato.
+        bool exact = false;
+        for (int i = 0; i < 4 && !exact; i++) {
+            SetWindowPos(hWnd, IntPtr.Zero, x, y, w, h, 0x0014); // SWP_NOZORDER | SWP_NOACTIVATE
+            for (int k = 0; k < 10 && !(exact = Exact(hWnd, x, y, w, h)); k++) Thread.Sleep(25);
+        }
+        if (maximized) {
+            ShowWindowAsync(hWnd, 3); // SW_SHOWMAXIMIZED, no monitor onde a janela está agora
+            for (int i = 0; i < 50 && !IsZoomed(hWnd); i++) Thread.Sleep(20);
+            return IsZoomed(hWnd) ? "OK" : "PART";
+        }
+        return exact ? "OK" : "PART";
+    }
+}
+`;
+}
+
+/** Script PowerShell que executa uma lista de operações de posição e imprime uma linha `R ...` por operação. */
+export function buildPlacementScript(profileDir: string, jobs: PlacementJob[], browser?: BrowserSelection): string {
+  const payload = jobs.map((j) => ({
+    m: typeof j.marker === 'string' && j.marker.trim() ? j.marker : undefined,
+    h: typeof j.hwnd === 'number' && Number.isSafeInteger(j.hwnd) && j.hwnd > 0 ? j.hwnd : undefined,
+    a: j.apply ? validPlacement(j.apply) : undefined,
+  }));
+  const jobsB64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
+  const profileDirB64 = Buffer.from(profileDir, 'utf8').toString('base64');
+  const exeCheck = browser
+    ? `$expectedExe = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${Buffer.from(browser.executable, 'utf8').toString('base64')}'))
+$expectedExe = [System.IO.Path]::GetFullPath($expectedExe).ToLowerInvariant()
+$expectedName = '${browser.processName}'`
+    : `$expectedName = 'brave'
+$expectedExe = $null`;
+
+  return `$ProgressPreference = 'SilentlyContinue'
+$ErrorActionPreference = 'Stop'
+
+$jobsJson = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${jobsB64}'))
+$targetProfile = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${profileDirB64}'))
+${exeCheck}
+
+if (-not ([System.Management.Automation.PSTypeName]'DeckWinPlacement').Type) {
+    Add-Type -TypeDefinition @'
+${placementHelperSource()}'@
+}
+
+$parsed = ConvertFrom-Json -InputObject $jobsJson
+$jobs = @($parsed)
+$targetNormalized = [System.IO.Path]::GetFullPath($targetProfile).TrimEnd('\\', '/').ToLowerInvariant()
+$script:pidOk = @{}
+
+function Test-DeckPid([uint32]$procId) {
+    if ($procId -eq 0) { return $false }
+    if ($script:pidOk.ContainsKey($procId)) { return $script:pidOk[$procId] }
+    $ok = $false
+    try {
+        $p = Get-Process -Id $procId -ErrorAction Stop
+        if ($p.ProcessName -eq $expectedName) {
+            $cmd = $null
+            $procExe = $null
+            try {
+                $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $procId" -ErrorAction Stop
+                $cmd = $cim.CommandLine
+                $procExe = $cim.ExecutablePath
+            } catch {
+                try {
+                    $wmi = Get-WmiObject Win32_Process -Filter "ProcessId = $procId" -ErrorAction Stop
+                    $cmd = $wmi.CommandLine
+                    $procExe = $wmi.ExecutablePath
+                } catch {}
+            }
+            $exeOk = (-not $expectedExe) -or ($procExe -and [System.IO.Path]::GetFullPath($procExe).ToLowerInvariant() -eq $expectedExe)
+            if ($cmd -and $exeOk -and $cmd -match '--user-data-dir=(?:"([^"]+)"|''([^'']+)''|([^\\s]+))') {
+                $rawDir = if ($Matches[1]) { $Matches[1] } elseif ($Matches[2]) { $Matches[2] } else { $Matches[3] }
+                $procNormalized = [System.IO.Path]::GetFullPath($rawDir).TrimEnd('\\', '/').ToLowerInvariant()
+                $ok = ($procNormalized -eq $targetNormalized)
+            }
+        }
+    } catch {}
+    $script:pidOk[$procId] = $ok
+    return $ok
+}
+
+for ($i = 0; $i -lt $jobs.Count; $i++) {
+    $job = $jobs[$i]
+    try {
+        $hwnd = [IntPtr]::Zero
+        if ($job.h) {
+            $cand = [IntPtr][Int64]$job.h
+            if (Test-DeckPid ([DeckWinPlacement]::DeckProcessOf($cand))) { $hwnd = $cand }
+        }
+        if ($hwnd -eq [IntPtr]::Zero -and $job.m) {
+            foreach ($w in [DeckWinPlacement]::FindWindows([string]$job.m)) {
+                if (Test-DeckPid $w.ProcessId) { $hwnd = $w.Handle; break }
+            }
+        }
+        if ($hwnd -eq [IntPtr]::Zero) { Write-Output "R $i MISS"; continue }
+        $result = '-'
+        if ($job.a) {
+            $a = $job.a
+            $result = [DeckWinPlacement]::Apply($hwnd, [int]$a.x, [int]$a.y, [int]$a.width, [int]$a.height, [bool]$a.maximized)
+        }
+        $read = [DeckWinPlacement]::Read($hwnd)
+        if ($read) { Write-Output "R $i $($hwnd.ToInt64()) $read $result" } else { Write-Output "R $i MISS" }
+    } catch {
+        Write-Output "R $i MISS"
+    }
+}
+`;
+}
+
+/**
+ * Lê (e, com `apply`, reposiciona) janelas do Deck no Windows. Um PowerShell por chamada, sem processo
+ * residente. Devolve um resultado por operação, `null` quando a janela não foi achada ou fora do Windows.
+ */
+export async function runPlacement(
+  profileDir: string,
+  jobs: PlacementJob[],
+  options?: FocusWindowOptions,
+): Promise<(PlacementResult | null)[]> {
+  const none = jobs.map(() => null);
+  const platform = options?.platform ?? process.platform;
+  if (platform !== 'win32' || !jobs.length) return none;
+  if (typeof profileDir !== 'string' || !profileDir.trim()) return none;
+  if (options?.browser?.id === 'firefox') return none;
+  const encoded = Buffer.from(buildPlacementScript(profileDir, jobs, options?.browser), 'utf16le').toString('base64');
+  const psExe = resolvePowerShellExe(options?.powerShellPath);
+  const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded];
+  const timeout = options?.timeoutMs ?? 15_000;
+  const runExec = options?.execFileFn ?? execFile;
+  return new Promise((resolve) => {
+    try {
+      runExec(psExe, args, { timeout, windowsHide: true }, (error, stdout) => {
+        resolve(error ? none : parsePlacementOutput(String(stdout ?? ''), jobs.length));
+      });
+    } catch {
+      resolve(none);
     }
   });
 }

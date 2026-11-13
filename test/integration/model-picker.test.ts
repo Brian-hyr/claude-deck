@@ -65,4 +65,37 @@ describe('seletor de modelo (sessions.setModel)', () => {
     expect(reset.model).toBeUndefined();
     expect(reset.phase).toBe('idle');
   });
+
+  it('modo automático: mostra a escolha do gateway e ela sobrevive ao "init" de cada pedido', async () => {
+    // O hook do gateway deixa o aviso só no transcript (pasta temporária do CLAUDE_CONFIG_DIR); nada é gravado
+    // na pasta pessoal de verdade.
+    const s = await env.client.call('sessions.create', { hostId: 'local', cwd, model: 'auto[1m]' });
+    await env.client.waitFor((e) => e.event === 'session.state' && e.data.sid === s.sid && e.data.phase === 'idle', 20_000, 'pronto');
+    const send = (text: string) => env.client.call('sessions.send', { sid: s.sid, content: [{ type: 'text', text }], uuid: crypto.randomUUID() });
+    const turns = () => env.client.events.filter((e) => e.event === 'session.msg' && e.data.sid === s.sid && e.data.msg.type === 'result').length;
+
+    await send('olá');
+    const picked = await env.client.waitFor((e) => e.event === 'session.state' && e.data.sid === s.sid && !!e.data.autoPick, 20_000, 'escolha do gateway');
+    // O CLI continua no automático; a escolha fica à parte, casada com o seletor ("Fake Opus" → fake-opus).
+    expect(picked.data.model).toBe('auto[1m]');
+    expect(picked.data.autoPick).toMatchObject({ model: 'fake-opus', effort: 'medium' });
+    expect(picked.data.effort).toBeUndefined(); // nada de --effort imposto à conversa
+
+    // 2º pedido: o CLI repete o "init" com o modelo automático. Antes, isso apagava o que estava no seletor.
+    await env.client.waitFor(() => turns() >= 1, 20_000, '1º turno');
+    const from = env.client.events.length;
+    await send('reinit de novo');
+    await env.client.waitFor(() => turns() >= 2, 20_000, '2º turno');
+    const reinit = env.client.events.slice(from).filter((e) => e.event === 'session.msg' && e.data.sid === s.sid && e.data.msg.subtype === 'init');
+    expect(reinit.length).toBeGreaterThan(0);
+    const after = await stateOf(s.sid);
+    expect(after.model).toBe('auto[1m]');
+    expect(after.autoPick).toMatchObject({ model: 'fake-opus', effort: 'medium' });
+
+    // Trocou de modelo no seletor: a escolha do gateway deixa de valer.
+    await env.client.call('sessions.setModel', { sid: s.sid, model: 'fake-sonnet' });
+    const manual = await stateOf(s.sid);
+    expect(manual.model).toBe('fake-sonnet');
+    expect(manual.autoPick).toBeUndefined();
+  });
 });

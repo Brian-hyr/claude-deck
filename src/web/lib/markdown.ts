@@ -64,6 +64,78 @@ export function highlightCode(code: string, lang?: string): string {
   return escapeHtml(code);
 }
 
+/**
+ * Renderiza equações matemáticas simples (LaTeX) em HTML seguro e legível.
+ * Protegido contra streaming incompleto e falhas de parser.
+ */
+function renderMathText(tex: string): string {
+  // Transforma símbolos matemáticos comuns em entidades/caracteres legíveis com tipografia matemática limpa
+  let s = escapeHtml(tex.trim());
+  s = s.replace(/\\times\b/g, '×')
+       .replace(/\\cdot\b/g, '·')
+       .replace(/\\div\b/g, '÷')
+       .replace(/\\pm\b/g, '±')
+       .replace(/\\approx\b/g, '≈')
+       .replace(/\\neq\b/g, '≠')
+       .replace(/\\leq\b/g, '≤')
+       .replace(/\\geq\b/g, '≥')
+       .replace(/\\in\b/g, '∈')
+       .replace(/\\infty\b/g, '∞')
+       .replace(/\\sqrt\{([^}]+)\}/g, '√($1)')
+       .replace(/\\frac\{([^}]+)\}\{([^}]+)\}/g, '($1 / $2)')
+       .replace(/\\sum\b/g, '∑')
+       .replace(/\\prod\b/g, '∏')
+       .replace(/\\int\b/g, '∫')
+       .replace(/\\alpha\b/g, 'α')
+       .replace(/\\beta\b/g, 'β')
+       .replace(/\\gamma\b/g, 'γ')
+       .replace(/\\delta\b/g, 'δ')
+       .replace(/\\theta\b/g, 'θ')
+       .replace(/\\lambda\b/g, 'λ')
+       .replace(/\\pi\b/g, 'π')
+       .replace(/\\sigma\b/g, 'σ')
+       .replace(/\\omega\b/g, 'ω')
+       .replace(/\\Delta\b/g, 'Δ')
+       .replace(/\\Sigma\b/g, 'Σ')
+       .replace(/\\Omega\b/g, 'Ω')
+       .replace(/\\text\{([^}]+)\}/g, '$1')
+       .replace(/\\mathbf\{([^}]+)\}/g, '<b>$1</b>')
+       .replace(/\\mathit\{([^}]+)\}/g, '<i>$1</i>');
+  return s;
+}
+
+/**
+ * Pré-processa delimitadores LaTeX ($$ e $) em marcadores HTML seguros antes do Marked,
+ * ignorando blocos de código já cercados por ``` ou ` inline e evitando travamentos durante streaming.
+ */
+export function preprocessLatexMath(raw: string): string {
+  if (!raw.includes('$')) return raw;
+
+  // Isola blocos de código com cercas triplas para não tocar no que for código
+  const parts = raw.split(/(```[\s\S]*?```)/g);
+  return parts.map((part, idx) => {
+    if (idx % 2 === 1) return part; // bloco de código ```...``` fica intacto
+
+    // 1. Math em bloco: $$...$$
+    let res = part.replace(/\$\$([\s\S]+?)\$\$/g, (_match, math) => {
+      const rendered = renderMathText(math);
+      return `\n\n<div class="md-math-block" data-tex="${escapeHtml(math.trim())}"><span class="md-math-content">${rendered}</span></div>\n\n`;
+    });
+
+    // 2. Math inline: $...$ (não casa $ solto nem valores monetários como $10 ou $ 10)
+    res = res.replace(/(^|[^\\])\$([^\s$](?:[^$]*?[^\s$])?)\$/g, (_match, prefix, math) => {
+      // Se for apenas dígitos/ponto, pode ser quantia monetária (ex: $50)
+      if (/^\d+(?:[.,]\d+)?$/.test(math.trim())) {
+        return `${prefix}$${math}$`;
+      }
+      const rendered = renderMathText(math);
+      return `${prefix}<span class="md-math-inline" data-tex="${escapeHtml(math.trim())}">${rendered}</span>`;
+    });
+
+    return res;
+  }).join('');
+}
+
 const md = new Marked({ gfm: true, breaks: false });
 md.use({
   renderer: {
@@ -108,9 +180,10 @@ const cache = new Map<string, string>();
 export function renderMarkdown(text: string, imgResolver?: (src: string) => string | null): string {
   const key = imgResolver ? '' : text;
   if (key && cache.has(key)) return cache.get(key)!;
-  let html = md.parse(text, { async: false }) as string;
+  const processed = preprocessLatexMath(text);
+  let html = md.parse(processed, { async: false }) as string;
   html = DOMPurify.sanitize(html, {
-    ADD_ATTR: ['target', 'data-href'],
+    ADD_ATTR: ['target', 'data-href', 'data-tex'],
     FORBID_TAGS: ['style', 'form', 'input', 'button', 'iframe', 'object', 'embed'],
     ALLOW_DATA_ATTR: true,
     ADD_TAGS: [],

@@ -21,6 +21,7 @@ export interface HostInfo {
 }
 
 export type HostConnState = 'idle' | 'connecting' | 'ready' | 'error' | 'reconnecting';
+export type AgentEngine = 'claude' | 'antigravity';
 
 export interface HostStatus {
   id: string;
@@ -30,6 +31,8 @@ export interface HostStatus {
   home?: string;
   claude?: { path: string; version: string } | null;
   claudeCandidates?: { path: string; version: string }[];
+  agy?: { path: string; version: string } | null;
+  agyCandidates?: { path: string; version: string }[];
   /**
    * Versão mais nova do Claude Code publicada, quando é maior que a do servidor e ele pode ser atualizado
    * (só SSH). Ausente = em dia, desconhecida ou sem como atualizar. Ver HostRegistry.status.
@@ -155,15 +158,30 @@ export type SessionPhase =
   | 'error';
 
 /** Estado de uma conversa aberta (aba de chat). */
+/** Escolha do gateway para uma conversa no modo automático. */
+export interface AutoModelPick {
+  /** Valor do seletor de modelo (ex. `flash38[1m]`), ou o nome recebido se o seletor não tiver esse modelo. */
+  model: string;
+  effort?: EffortLevel;
+  /** Rótulo do gateway, ex. "N2 · Flash 3.8 low". */
+  label?: string;
+}
+
 export interface SessionState {
   sid: string; // id da aba/conversa no app
   hostId: string;
   cwd: string;
-  sessionId?: string; // id do Claude Code (transcript)
+  engine?: AgentEngine;
+  sessionId?: string; // id do Claude Code / Antigravity (transcript)
   title?: string;
   phase: SessionPhase;
   error?: string;
   model?: string;
+  /**
+   * Modelo automático (`auto[1m]`): o que o gateway escolheu para esta conversa (descoberto depois do 1º pedido).
+   * `model` continua sendo o automático, que é o que o CLI roda; isto é só para mostrar.
+   */
+  autoPick?: AutoModelPick;
   /** Sem valor explícito, o Claude Code usa seu próprio nível padrão. */
   effort?: EffortLevel;
   permissionMode?: PermissionMode;
@@ -172,6 +190,12 @@ export interface SessionState {
    * digita no terminal visível desta conversa (ferramentas deck_terminal) e lê a tela dele.
    */
   executionMode?: 'silent' | 'terminal';
+  /**
+   * Aprovar sozinho: o Deck responde "permitir" a todo pedido de permissão de ferramenta desta
+   * conversa (útil quando o usuário está longe do PC). Perguntas (AskUserQuestion) e aprovação de
+   * plano (ExitPlanMode) continuam esperando o usuário.
+   */
+  autoApprove?: boolean;
   /** Terminal ligado a esta conversa no modo Terminal ao Vivo. */
   terminalId?: string;
   claudeVersion?: string;
@@ -202,6 +226,88 @@ export interface SessionState {
    * usa o que ela mesma observou e, por fim, `createdAt`.
    */
   lastActivityAt?: number;
+  /** Papel da conversa numa orquestração (orquestrador ou worker). Ausente nas conversas comuns. */
+  orq?: SessionOrqRole;
+}
+
+/** Vínculo de uma conversa com uma orquestração. */
+export interface SessionOrqRole {
+  /** Id da orquestração. */
+  id: string;
+  role: 'orchestrator' | 'worker';
+  /** Só workers: tarefa (T3) e id do worker (T3.1 = tarefa + tentativa). */
+  taskId?: string;
+  workerId?: string;
+}
+
+// ------------------------------------------------------------------ orquestrador
+
+/** Esforço do orquestrador (planeja e verifica): Alto ou acima. */
+export const ORQ_EFFORTS = ['high', 'xhigh', 'max'] as const;
+export type OrqEffort = (typeof ORQ_EFFORTS)[number];
+/** Esforço dos workers (os chats que o orquestrador abre): Médio ou acima; Baixo nunca. */
+export const ORQ_WORKER_EFFORTS = ['medium', 'high', 'xhigh', 'max'] as const;
+export type OrqWorkerEffort = (typeof ORQ_WORKER_EFFORTS)[number];
+
+export type OrqStatus =
+  | 'planning' // estudando o projeto, perguntando e montando o plano
+  | 'awaiting_approval' // plano enviado: só cria workers depois do botão "Aprovar"
+  | 'running'
+  | 'waiting_user' // o orquestrador pediu algo ao usuário: sem lembretes até ele responder
+  | 'paused' // o usuário pausou: nada é entregue sozinho ao orquestrador
+  | 'stalled' // parou várias vezes com tarefas pendentes: precisa do usuário
+  | 'done'
+  | 'cancelled';
+
+export type OrqTaskStatus = 'pending' | 'in_progress' | 'review' | 'done' | 'blocked' | 'cancelled';
+export type OrqWorkerRole = 'implement' | 'review' | 'research';
+export type OrqWorkerState = 'starting' | 'working' | 'waiting_permission' | 'waiting_answer' | 'idle' | 'error' | 'stopped' | 'closed';
+export type OrqReportStatus = 'done' | 'done_with_concerns' | 'needs_context' | 'blocked';
+
+export interface OrqTaskView {
+  id: string;
+  title: string;
+  status: OrqTaskStatus;
+  deps: string[];
+  files: string[];
+  workers: string[];
+}
+
+export interface OrqWorkerView {
+  id: string;
+  taskId: string;
+  sid: string;
+  role: OrqWorkerRole;
+  state: OrqWorkerState;
+  model?: string;
+  effort: OrqWorkerEffort;
+  report?: OrqReportStatus;
+  costUsd?: number;
+  startedAt: number;
+}
+
+/** Resumo de uma orquestração para a interface (painel do orquestrador e marcas nas abas). */
+export interface OrchestrationView {
+  id: string;
+  hostId: string;
+  cwd: string;
+  wid?: string;
+  orchestratorSid: string;
+  title: string;
+  status: OrqStatus;
+  stateDir: string;
+  createdAt: number;
+  settings: { workerPermissionMode: PermissionMode; maxParallel: number; requireApproval: boolean };
+  tasks: OrqTaskView[];
+  workers: OrqWorkerView[];
+  /** Eventos dos workers ainda não entregues ao orquestrador. */
+  queued: number;
+  /** Resumo do plano (plan_submit), para o usuário aprovar sabendo o quê. */
+  planSummary?: string;
+  /** Modelos recusados pelo gateway agora (o Deck trocou de modelo por causa deles). */
+  exhaustedModels?: { model: string; kind: 'exhausted' | 'unavailable'; until: number; reason: string }[];
+  /** Resumo final (orq_finish). */
+  summary?: string;
 }
 
 export interface ModelOption {
@@ -235,12 +341,21 @@ export interface Settings {
   editorTabSize: number;
   defaultPermissionMode: PermissionMode;
   defaultModel: string; // '' = padrão do servidor
+  defaultEngine: AgentEngine;
   sendWithCtrlEnter: boolean;
   notifications: boolean;
   showThinking: boolean;
   remoteIdleHours: number;
+  /** Quando o processo do Claude é morto à força (código 137, ex.: monitor do servidor/OOM) no meio de uma tarefa, manda a mensagem abaixo para ele seguir. */
+  autoResumeOnKill: boolean;
+  /** Texto enviado ao retomar sozinho ('' = "continue"). */
+  autoResumeMessage: string;
+  /** Quedas seguidas (em até 5 min uma da outra) antes de desistir e esperar o usuário. */
+  autoResumeMax: number;
   localClaudePath: string; // '' = automático
   hostClaudePath: Record<string, string>;
+  localAgyPath: string; // '' = automático
+  hostAgyPath: Record<string, string>;
   maxOpenFileMB: number;
   /** Onde o terminal integrado abre: à direita da conversa (padrão) ou embaixo. */
   terminalPosition: 'right' | 'bottom';
@@ -256,13 +371,19 @@ export const DEFAULT_SETTINGS: Settings = {
   editorWordWrap: false,
   editorTabSize: 2,
   defaultPermissionMode: 'default',
-  defaultModel: '',
+  defaultModel: 'flash38[1m]',
+  defaultEngine: 'claude',
   sendWithCtrlEnter: false,
   notifications: true,
   showThinking: false,
   remoteIdleHours: 6,
+  autoResumeOnKill: false,
+  autoResumeMessage: 'continue',
+  autoResumeMax: 5,
   localClaudePath: '',
   hostClaudePath: {},
+  localAgyPath: '',
+  hostAgyPath: {},
   maxOpenFileMB: 20,
   terminalPosition: 'right',
   terminalHighlight: true,
@@ -292,6 +413,20 @@ export interface UiState {
   terminalVisible?: boolean;
   terminalHeight?: number;
   terminalWidth?: number;
+  /** Grupos de abas recolhidos (id da orquestração cujas conversas formam o grupo). */
+  collapsedTabGroups?: string[];
+}
+
+/**
+ * Posição de uma janela no Windows, lida e reaplicada pelo servidor (Win32), em pixels físicos de tela.
+ * Com a janela maximizada (ou minimizada), x/y/width/height são o retângulo para onde ela volta ao restaurar.
+ */
+export interface WindowBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  maximized?: boolean;
 }
 
 export interface TerminalTabInfo {
@@ -311,6 +446,8 @@ export interface PersistedChatTab {
   sessionId?: string;
   title?: string;
   runnerId?: string;
+  /** Aba fixada: fica no começo da faixa, na ordem em que as fixadas estão salvas. */
+  pinned?: boolean;
 }
 
 export interface PersistedFileTab {
@@ -338,4 +475,69 @@ export interface SearchResult {
   matches: SearchMatch[];
   filesWithMatches: number;
   truncated: boolean;
+}
+
+// ------------------------------------------------------------------ Claude Code settings.json
+
+export type ClaudeSettingsScope = 'user' | 'project';
+
+export interface ClaudeModelPickerOption {
+  model: string;
+  label?: string;
+  description?: string;
+  behavesAs?: string;
+}
+
+export interface ClaudeSettingsJson {
+  env?: Record<string, string>;
+  model?: string;
+  modelPicker?: {
+    options?: ClaudeModelPickerOption[];
+    replaceBuiltInOptions?: boolean;
+  };
+  permissions?: {
+    allow?: string[];
+    deny?: string[];
+    ask?: string[];
+  };
+  effortLevel?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+  modelSettings?: Record<string, { effortLevel?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' }>;
+  alwaysApproveResubmissions?: boolean;
+  theme?: string;
+  tui?: string;
+  agentPushNotifEnabled?: boolean;
+  hasCompletedOnboarding?: boolean;
+  [key: string]: unknown;
+}
+
+export interface ClaudeSettingsGetParams {
+  hostId: string;
+  scope: ClaudeSettingsScope;
+  cwd?: string;
+}
+
+export interface ClaudeSettingsGetResult {
+  exists: boolean;
+  path: string;
+  scope: ClaudeSettingsScope;
+  hostId: string;
+  settings: ClaudeSettingsJson;
+  raw: string;
+  mtime: number;
+  error?: string;
+}
+
+export interface ClaudeSettingsSaveParams {
+  hostId: string;
+  scope: ClaudeSettingsScope;
+  cwd?: string;
+  settings?: ClaudeSettingsJson;
+  raw?: string;
+}
+
+export interface ClaudeSettingsSaveResult {
+  ok: boolean;
+  path: string;
+  mtime: number;
+  backupPath?: string;
 }

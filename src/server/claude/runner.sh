@@ -90,6 +90,26 @@ find_claude() {
   bins | sort -t "$(printf '\t')" -k1,1V | tail -1 | cut -f2
 }
 
+agy_bins() {
+  {
+    command -v agy 2>/dev/null
+    for c in "$HOME/.local/bin/agy" "$HOME/bin/agy" "$HOME/.npm-global/bin/agy" \
+             /usr/local/bin/agy /usr/bin/agy /opt/homebrew/bin/agy \
+             "$HOME/.gemini/antigravity/bin/agy" "$HOME/.antigravity/bin/agy"; do
+      echo "$c"
+    done
+    ls -d "$HOME"/.nvm/versions/node/*/bin/agy 2>/dev/null
+  } | while IFS= read -r c; do
+    [ -n "$c" ] && [ -x "$c" ] && [ ! -d "$c" ] || continue
+    real=$(readlink -f "$c" 2>/dev/null || echo "$c")
+    printf '%s\t%s\t%s\n' "$real" "$(version_of "$c")" "$c"
+  done | awk -F '\t' '!seen[$1]++ { print $2 "\t" $3 }'
+}
+
+find_agy() {
+  agy_bins | sort -t "$(printf '\t')" -k1,1V | tail -1 | cut -f2
+}
+
 forward() {
   # Repassa só linhas COMPLETAS: uma linha JSON cortada por queda de rede
   # derrubaria o Claude (ele encerra ao receber JSON inválido).
@@ -120,6 +140,8 @@ case "$cmd" in
     cwd=$(printf '%s' "$2" | base64 -d 2>/dev/null) || { echo "ERR badcwd"; exit 2; }
     if [ "$3" = auto ]; then
       bin=$(find_claude)
+    elif [ "$3" = auto_agy ]; then
+      bin=$(find_agy)
     else
       bin=$(printf '%s' "$3" | base64 -d 2>/dev/null) || { echo "ERR badbin"; exit 2; }
     fi
@@ -128,7 +150,10 @@ case "$cmd" in
     case "$idle" in ''|*[!0-9]*) idle=21600 ;; esac
     # Nunca dois processos na mesma conversa: se o anterior segue vivo, o app só reanexa.
     if [ -d "$D" ] && alive "$D"; then echo "ALIVE $(cat "$D/pid") $(fsize "$D/out")"; exit 0; fi
-    if [ -z "$bin" ] || [ ! -x "$bin" ]; then echo "ERR noclaude"; exit 4; fi
+    if [ -z "$bin" ] || [ ! -x "$bin" ]; then
+      if [ "$3" = auto_agy ]; then echo "ERR noagy"; else echo "ERR noclaude"; fi
+      exit 4
+    fi
     cd "$cwd" 2>/dev/null || { echo "ERR nocwd"; exit 3; }
     mkdir -p "$D" || { echo "ERR mkdir"; exit 5; }
     rm -f "$D/in" "$D/pid" "$D/st" "$D/exit"
@@ -267,6 +292,10 @@ case "$cmd" in
 
   bins)
     bins
+    ;;
+
+  agy_bins)
+    agy_bins
     ;;
 
   gc)

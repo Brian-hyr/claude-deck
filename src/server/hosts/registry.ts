@@ -1,5 +1,6 @@
 // Registro de servidores: o computador local + os aliases do ~/.ssh/config.
 import { EventEmitter } from 'node:events';
+import child_process from 'node:child_process';
 import crypto from 'node:crypto';
 import os from 'node:os';
 import type { ClaudeUpdateResult, HostInfo, HostStatus, Platform } from '../../shared/types';
@@ -10,14 +11,20 @@ import { SshHost } from './ssh';
 import type { PromptBroker } from '../prompts';
 import type { Store } from '../config';
 import type { HostFs } from '../fs/hostfs';
+import { shq } from '../fs/hostfs';
 import { LocalFs } from '../fs/localfs';
 import { SftpFs } from '../fs/sftpfs';
-import { findLocalClaude } from '../claude/find-local';
+import { findLocalAgy, findLocalClaude } from '../claude/find-local';
 import { LatestClaude } from '../claude/latest';
 import { buildUpdateCommand, classifyClaudeBin, parseUpdateOutput } from '../claude/update';
 import { isNewerVersion, isPlainVersion } from '../../shared/version';
-import runnerScript from '../claude/runner.sh';
+import runnerSource from '../claude/runner.sh';
 
+/**
+ * Sempre com LF: um checkout no Windows com `core.autocrlf=true` traz o script com CRLF, e o `sh` do servidor
+ * não aceita o `\r` ("Syntax error: word unexpected (expecting "in")"). Com LF o hash não muda.
+ */
+const runnerScript = runnerSource.replace(/\r\n?/g, '\n');
 export const RUNNER_HASH = crypto.createHash('sha1').update(runnerScript).digest('hex').slice(0, 10);
 export const RUNNER_NAME = `runner-${RUNNER_HASH}.sh`;
 /** Caminho do runner no servidor, relativo a $HOME. */
@@ -67,6 +74,7 @@ export class HostRegistry extends EventEmitter {
    */
   private noNewer = new Map<string, string>();
   private updating = new Map<string, Promise<ClaudeUpdateResult>>();
+  private installingAgy = new Map<string, Promise<{ version: string; output: string }>>();
 
   constructor(
     private store: Store,
@@ -197,9 +205,14 @@ export class HostRegistry extends EventEmitter {
       if (/MINGW|MSYS|CYGWIN|Windows/i.test(osName)) throw new DeckError('unsupported', `${id} é Windows; só servidores Linux/macOS são suportados.`);
       if (/RUNNER=ok/.test(probe.stdout)) this.runnerReady.add(id);
       else this.runnerReady.delete(id);
-      const bins = await this.remoteBins(id);
+      const [bins, agyBins] = await Promise.all([
+        this.remoteBins(id).catch(() => []),
+        this.remoteAgyBins(id).catch(() => []),
+      ]);
       const override = this.store.settings.hostClaudePath[id];
+      const agyOverride = this.store.settings.hostAgyPath?.[id];
       const chosen = override ? { path: override, version: bins.find((b) => b.path === override)?.version ?? '?' } : bins[0] ?? null;
+      const agyChosen = agyOverride ? { path: agyOverride, version: agyBins.find((b) => b.path === agyOverride)?.version ?? '?' } : agyBins[0] ?? null;
       const st: HostStatus = {
         ...this.status(id),
         id,
@@ -209,6 +222,8 @@ export class HostRegistry extends EventEmitter {
         home,
         claude: chosen,
         claudeCandidates: bins,
+        agy: agyChosen,
+        agyCandidates: agyBins,
       };
       // Dá um instante para a consulta terminar, para o primeiro status já levar o aviso. Se demorar, o aviso
       // chega num segundo status quando ela acabar (a conexão nunca fica esperando a internet).
@@ -232,6 +247,7 @@ export class HostRegistry extends EventEmitter {
 
   private connectLocal(): HostStatus {
     const bins = findLocalClaude(this.store.settings.localClaudePath || undefined);
+    const agyBins = findLocalAgy(this.store.settings.localAgyPath || undefined);
     const st: HostStatus = {
       id: LOCAL_HOST_ID,
       state: 'ready',
@@ -239,6 +255,8 @@ export class HostRegistry extends EventEmitter {
       home: os.homedir(),
       claude: bins[0] ? { path: bins[0].path, version: bins[0].version } : null,
       claudeCandidates: bins.map((b) => ({ path: b.path, version: b.version })),
+      agy: agyBins[0] ? { path: agyBins[0].path, version: agyBins[0].version } : null,
+      agyCandidates: agyBins.map((b) => ({ path: b.path, version: b.version })),
     };
     this.updateStatus(LOCAL_HOST_ID, st);
     return st;
@@ -274,7 +292,7 @@ export class HostRegistry extends EventEmitter {
    * Teste de conexão sem interação (não pede senha nem confirma chave nova) e só de leitura.
    * Se o servidor não estava conectado antes, desconecta no fim.
    */
-  async check(id: string): Promise<{ ok: boolean; ms: number; error?: string; claude?: { path: string; version: string } | null; claudeLatest?: string }> {
+  async check(id: string): Promise<{ ok: boolean; ms: number; error?: string; claude?: { path: string; version: string } | null; claudeLatest?: string; agy?: { path: string; version: string } | null }> {
     const h = this.get(id);
     if (!h.ssh) return { ok: true, ms: 0 };
     const ssh = h.ssh;
@@ -283,7 +301,7 @@ export class HostRegistry extends EventEmitter {
     const t0 = Date.now();
     try {
       const st = await this.connect(id, true);
-      return { ok: true, ms: Date.now() - t0, claude: st.claude ?? null, claudeLatest: st.claudeLatest };
+      return { ok: true, ms: Date.now() - t0, claude: st.claude ?? null, claudeLatest: st.claudeLatest, agy: st.agy ?? null };
     } catch (e) {
       return { ok: false, ms: Date.now() - t0, error: (e as Error).message };
     } finally {
@@ -342,11 +360,102 @@ export class HostRegistry extends EventEmitter {
     throw new DeckError('update', out.tail || `O "claude update" terminou com erro${out.exit != null ? ` (código ${out.exit})` : ''} e a versão não mudou.`);
   }
 
+  /**
+   * Instala o Antigravity CLI no servidor (ou localmente).
+   * Roda o instalador oficial e atualiza o status do servidor.
+   */
+  installAgy(id: string): Promise<{ version: string; output: string }> {
+    const running = this.installingAgy.get(id);
+    if (running) return running;
+    const p = this.doInstallAgy(id).finally(() => this.installingAgy.delete(id));
+    this.installingAgy.set(id, p);
+    return p;
+  }
+
+  private async doInstallAgy(id: string): Promise<{ version: string; output: string }> {
+    if (id === LOCAL_HOST_ID) {
+      this.log('[local] instalando Antigravity CLI...');
+      const proc = child_process.spawn(
+        'powershell.exe',
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', 'irm https://antigravity.google/cli/install.ps1 | iex'],
+        { windowsHide: true },
+      );
+      let stdout = '';
+      let stderr = '';
+      proc.stdout?.on('data', (d) => { stdout += d.toString(); });
+      proc.stderr?.on('data', (d) => { stderr += d.toString(); });
+      await new Promise<void>((resolve, reject) => {
+        proc.on('close', (code) => {
+          if (code === 0) resolve();
+          else reject(new DeckError('install', `Falha ao instalar Antigravity CLI localmente (código ${code}):\n${stderr || stdout}`));
+        });
+        proc.on('error', reject);
+      });
+      const st = this.connectLocal();
+      if (!st.agy) {
+        throw new DeckError('install', `Instalador concluiu, mas o executável "agy" não foi detectado neste computador.\nSaída:\n${stdout || stderr}`);
+      }
+      this.log(`[local] Antigravity CLI instalado com sucesso: ${st.agy.path} (${st.agy.version})`);
+      return { version: st.agy.version, output: stdout || stderr };
+    }
+
+    const ssh = this.get(id).ssh!;
+    await ssh.ensure();
+    this.log(`[${id}] instalando Antigravity CLI no servidor...`);
+    const script =
+      'if command -v curl >/dev/null 2>&1; then ' +
+      '  curl -fsSL https://antigravity.google/cli/install.sh | bash; ' +
+      'elif command -v wget >/dev/null 2>&1; then ' +
+      '  wget -qO- https://antigravity.google/cli/install.sh | bash; ' +
+      'elif command -v npm >/dev/null 2>&1; then ' +
+      '  npm install -g @google/antigravity 2>&1 || npm install -g antigravity 2>&1; ' +
+      'else ' +
+      '  echo "ERR: curl ou wget não encontrado no servidor"; exit 127; ' +
+      'fi';
+    const cmd = `exec "\${SHELL:-/bin/sh}" -lc ${shq(script)}`;
+    let res: { stdout: string; stderr: string };
+    try {
+      res = await ssh.run(cmd, { timeoutMs: 300_000, maxBytes: 512 * 1024 });
+    } catch (e) {
+      if ((e as DeckError).code === 'timeout') {
+        throw new DeckError('timeout', `A instalação em ${id} passou de 5 minutos e foi interrompida.`);
+      }
+      throw e;
+    }
+
+    // Re-escaneia os binários do servidor
+    const st = await this.connect(id, true);
+    if (!st.agy) {
+      const out = (res.stdout + '\n' + res.stderr).trim();
+      throw new DeckError('install', `O instalador rodou em ${id}, mas o executável "agy" não foi detectado.\nSaída:\n${out.slice(-400)}`);
+    }
+    this.log(`[${id}] Antigravity CLI instalado com sucesso: ${st.agy.path} (${st.agy.version})`);
+    return { version: st.agy.version, output: res.stdout || res.stderr };
+  }
+
   /** Lista os binários do Claude no servidor (maior versão primeiro), sem gravar nada lá. */
   async remoteBins(id: string): Promise<{ path: string; version: string }[]> {
     const ssh = this.get(id).ssh!;
     // O script do runner vai pela entrada padrão ("sh -s bins"): funciona antes de instalar.
     const r = await ssh.run(`exec "\${SHELL:-/bin/sh}" -lc 'sh -s bins'`, { input: runnerScript, timeoutMs: 30_000 });
+    const bins = r.stdout
+      .split('\n')
+      .map((l) => l.split('\t'))
+      .filter((p) => p.length >= 2 && p[1].startsWith('/'))
+      .map(([version, p]) => ({ path: p.trim(), version: version.trim() || '?' }));
+    const cmp = (a: string, b: string) => {
+      const pa = a.split('.').map((x) => parseInt(x, 10) || 0);
+      const pb = b.split('.').map((x) => parseInt(x, 10) || 0);
+      for (let i = 0; i < 3; i++) if ((pa[i] ?? 0) !== (pb[i] ?? 0)) return (pb[i] ?? 0) - (pa[i] ?? 0);
+      return 0;
+    };
+    return bins.sort((a, b) => cmp(a.version, b.version));
+  }
+
+  /** Lista os binários do Antigravity CLI no servidor (maior versão primeiro), sem gravar nada lá. */
+  async remoteAgyBins(id: string): Promise<{ path: string; version: string }[]> {
+    const ssh = this.get(id).ssh!;
+    const r = await ssh.run(`exec "\${SHELL:-/bin/sh}" -lc 'sh -s agy_bins'`, { input: runnerScript, timeoutMs: 30_000 });
     const bins = r.stdout
       .split('\n')
       .map((l) => l.split('\t'))

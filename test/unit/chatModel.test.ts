@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
-import { ChatModel, costIncreases, formatSentAt, groupChatItems, isSubstantialText, msgTime, parsePartialJson, textRoles, totalInput, visibleUserText, type Item, type ResultItem, type ToolItem } from '../../src/web/lib/chatModel';
+import { ChatModel, costIncreases, formatSentAt, groupChatItems, isSubstantialText, msgTime, parsePartialJson, textRoles, totalInput, visibleUserText, type Item, type ResultItem, type ToolItem, type UserItem } from '../../src/web/lib/chatModel';
 import { isSyntheticBreadcrumb } from '../../src/shared/protocol';
 import { formatTokens } from '../../src/web/lib/format';
 
@@ -502,6 +502,30 @@ describe('modelo da conversa (captura real do CLI)', () => {
   });
 });
 
+describe('retomada automática depois do código 137 (avisos no chat)', () => {
+  const noticeTexts = (m: ChatModel) => m.items.filter((i) => i.kind === 'notice').map((i) => `${(i as any).tone}: ${(i as any).text}`);
+
+  it('mostra o erro da queda e depois o aviso de que vai retomar sozinho, com a tentativa e a espera', () => {
+    const m = new ChatModel();
+    m.apply({ type: 'deck_event', event: 'process_ended', code: 137, reason: 'exit', error: 'O Claude encerrou (código 137)' });
+    m.apply({ type: 'deck_event', event: 'auto_resume', attempt: 2, max: 5, delayMs: 10_000 });
+    expect(noticeTexts(m)).toEqual(['error: O Claude encerrou (código 137)', 'info: Retomando sozinho em 10 s (tentativa 2 de 5).']);
+    expect(m.running).toBe(false);
+  });
+
+  it('avisa quando desiste, dizendo que falta o usuário mandar algo', () => {
+    const m = new ChatModel();
+    m.apply({ type: 'deck_event', event: 'auto_resume_gave_up', attempts: 5 });
+    expect(noticeTexts(m)).toEqual(['warn: Parei de retomar sozinho depois de 5 quedas seguidas. Envie uma mensagem para continuar.']);
+  });
+
+  it('espera menor que 1 s aparece como 1 s (nunca "0 s")', () => {
+    const m = new ChatModel();
+    m.apply({ type: 'deck_event', event: 'auto_resume', attempt: 1, max: 3, delayMs: 150 });
+    expect(noticeTexts(m)).toEqual(['info: Retomando sozinho em 1 s (tentativa 1 de 3).']);
+  });
+});
+
 describe('agentes em execução (indicador ao lado do modelo)', () => {
   const launch = (id: string, input: any = { description: 'Procurar X', subagent_type: 'Explore' }, at?: string) => ({
     type: 'assistant',
@@ -760,6 +784,115 @@ describe('agentes em execução (indicador ao lado do modelo)', () => {
     expect(isSyntheticBreadcrumb({ type: 'user', message: { role: 'user', content: 'Olá, altere o modelo do projeto' } })).toBe(false);
   });
 
+  describe('reenviar mensagem enviada no meio da tarefa (canResend)', () => {
+    const ID = (n: number) => `0000000${n}-0000-4000-8000-000000000000`;
+    const result = (n: number) => ({ type: 'result', subtype: 'success', uuid: `res-${n}`, duration_ms: 10 });
+    const echo = (uuid: string, text: string) => ({ type: 'user', uuid, isReplay: true, message: { content: text } });
+    const working = (m: ChatModel) => m.apply({ type: 'system', subtype: 'status', status: 'requesting' });
+    const item = (m: ChatModel, uuid: string) => m.items.find((i) => i.key === `user:${uuid}`) as UserItem;
+
+    it('mensagem enviada com o Claude parado não é "no meio da tarefa" e nunca oferece reenvio', () => {
+      const m = new ChatModel();
+      m.addPendingUser(ID(1), 'primeira', []);
+      expect(item(m, ID(1)).midTurn).toBeUndefined();
+      m.apply(echo(ID(1), 'primeira'));
+      m.apply(result(1));
+      expect(m.canResend(item(m, ID(1)))).toBe(false);
+    });
+
+    it('enviada no meio da tarefa: só oferece reenviar depois que a tarefa acaba', () => {
+      const m = new ChatModel();
+      m.addPendingUser(ID(1), 'faça A', []);
+      m.apply(echo(ID(1), 'faça A'));
+      working(m);
+      m.addPendingUser(ID(2), 'e também B', []);
+      const b = item(m, ID(2));
+      expect(b.midTurn).toBe(true);
+      // Tarefa em andamento: o CLI ainda pode entregá-la no ciclo seguinte. Nada a oferecer.
+      expect(m.canResend(b)).toBe(false);
+      // O CLI entrega a mensagem (eco) e a tarefa continua: ainda sem botão.
+      m.apply(echo(ID(2), 'e também B'));
+      expect(b.pending).toBe(false);
+      expect(m.canResend(b)).toBe(false);
+      // Tarefa acabou sem o modelo responder à mensagem: agora dá para reenviar. A primeira (parado) nunca.
+      m.apply(result(1));
+      expect(m.canResend(b)).toBe(true);
+      expect(m.canResend(item(m, ID(1)))).toBe(false);
+    });
+
+    it('sem o eco do CLI e a tarefa acabada, também oferece (mensagem que pode nem ter chegado)', () => {
+      const m = new ChatModel();
+      m.addPendingUser(ID(1), 'faça A', []);
+      working(m);
+      m.addPendingUser(ID(2), 'e também B', []);
+      m.apply(result(1));
+      const b = item(m, ID(2));
+      expect(b.pending).toBe(true);
+      expect(m.canResend(b)).toBe(true);
+    });
+
+    it('o buffer do servidor repetindo o mesmo resultado não conta como outro turno', () => {
+      const m = new ChatModel();
+      m.addPendingUser(ID(1), 'faça A', []);
+      working(m);
+      m.addPendingUser(ID(2), 'e também B', []);
+      m.apply(echo(ID(2), 'e também B'));
+      m.apply(result(1));
+      m.apply(result(1), { replay: true });
+      expect(m.canResend(item(m, ID(2)))).toBe(true);
+    });
+
+    it('some se você escreveu qualquer outra coisa depois, ou se um turno novo já rodou', () => {
+      const m = new ChatModel();
+      m.addPendingUser(ID(1), 'faça A', []);
+      working(m);
+      m.addPendingUser(ID(2), 'e também B', []);
+      m.apply(echo(ID(2), 'e também B'));
+      m.apply(result(1));
+      expect(m.canResend(item(m, ID(2)))).toBe(true);
+      // Outra mensagem sua, já com o Claude parado: a conversa seguiu.
+      m.addPendingUser(ID(3), 'e agora C', []);
+      expect(m.canResend(item(m, ID(2)))).toBe(false);
+      // O CLI abriu sozinho o turno da mensagem que sobrou na fila: ela andou, o botão não volta depois.
+      const n = new ChatModel();
+      n.addPendingUser(ID(1), 'faça A', []);
+      working(n);
+      n.addPendingUser(ID(2), 'e também B', []);
+      n.apply(result(1));
+      n.apply(echo(ID(2), 'e também B')); // CLI processa a fila: novo turno
+      expect(n.running).toBe(true);
+      expect(n.canResend(item(n, ID(2)))).toBe(false);
+      n.apply(result(2));
+      expect(n.canResend(item(n, ID(2)))).toBe(false);
+    });
+
+    it('duas mensagens no mesmo turno: ambas reenviáveis; reenviar uma tira só o botão dela', () => {
+      const m = new ChatModel();
+      m.addPendingUser(ID(1), 'faça A', []);
+      working(m);
+      m.addPendingUser(ID(2), 'B', []);
+      m.addPendingUser(ID(3), 'C', []);
+      m.apply(echo(ID(2), 'B'));
+      m.apply(echo(ID(3), 'C'));
+      m.apply(result(1));
+      expect(m.canResend(item(m, ID(2)))).toBe(true);
+      expect(m.canResend(item(m, ID(3)))).toBe(true);
+      m.markResent(ID(2));
+      expect(m.canResend(item(m, ID(2)))).toBe(false);
+      expect(m.canResend(item(m, ID(3)))).toBe(true);
+    });
+
+    it('mensagem que falhou ao enviar não oferece reenvio (já tem o aviso de erro)', () => {
+      const m = new ChatModel();
+      m.addPendingUser(ID(1), 'faça A', []);
+      working(m);
+      m.addPendingUser(ID(2), 'B', []);
+      m.failPendingUser(ID(2), 'sem conexão');
+      m.apply(result(1));
+      expect(m.canResend(item(m, ID(2)))).toBe(false);
+    });
+  });
+
   it('eco de troca de modelo não vira mensagem no chat e não deixa o modelo rodando', () => {
     const m = new ChatModel();
     const breadcrumb = {
@@ -771,5 +904,117 @@ describe('agentes em execução (indicador ao lado do modelo)', () => {
     m.apply(breadcrumb);
     expect(m.running).toBe(false);
     expect(m.items).toHaveLength(0);
+  });
+
+  describe('reconstrução de métricas de rodapé a partir do transcript de histórico', () => {
+    it('reconstrói resultados com duração e tokens para turnos do transcript sem evento result explícito', () => {
+      const m = new ChatModel();
+      const t1User = '2026-11-05T12:00:00.000Z';
+      const t1Ast = '2026-11-05T12:00:15.000Z';
+      const t2User = '2026-11-05T12:05:00.000Z';
+      const t2Ast = '2026-11-05T12:05:40.000Z';
+
+      // Turno 1
+      m.apply({
+        type: 'user',
+        uuid: 'u-1',
+        timestamp: t1User,
+        message: { role: 'user', content: [{ type: 'text', text: 'Pergunta 1' }] },
+      }, { history: true });
+
+      m.apply({
+        type: 'assistant',
+        uuid: 'a-1',
+        timestamp: t1Ast,
+        message: {
+          id: 'msg-1',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Resposta 1' }],
+          usage: { input_tokens: 1500, cache_read_input_tokens: 4000, cache_creation_input_tokens: 200, output_tokens: 150 },
+        },
+      }, { history: true });
+
+      // Turno 2 (o novo pedido do usuário finaliza o turno 1 automaticamente)
+      m.apply({
+        type: 'user',
+        uuid: 'u-2',
+        timestamp: t2User,
+        message: { role: 'user', content: [{ type: 'text', text: 'Pergunta 2' }] },
+      }, { history: true });
+
+      m.apply({
+        type: 'assistant',
+        uuid: 'a-2',
+        timestamp: t2Ast,
+        message: {
+          id: 'msg-2',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Resposta 2' }],
+          usage: { input_tokens: 2200, cache_read_input_tokens: 5000, cache_creation_input_tokens: 0, output_tokens: 300 },
+        },
+      }, { history: true });
+
+      // Finaliza o último turno do histórico
+      m.finalizePendingTurn();
+
+      const results = m.items.filter((it) => it.kind === 'result') as ResultItem[];
+      expect(results).toHaveLength(2);
+
+      // Turno 1
+      expect(results[0].synthetic).toBe(true);
+      expect(results[0].subtype).toBe('success');
+      expect(results[0].durationMs).toBe(15_000); // 15 s
+      expect(results[0].tokens).toEqual({ input: 1500, cacheRead: 4000, cacheCreate: 200, output: 150 });
+      expect(results[0].at).toBe(new Date(t1Ast).getTime());
+
+      // Turno 2
+      expect(results[1].synthetic).toBe(true);
+      expect(results[1].subtype).toBe('success');
+      expect(results[1].durationMs).toBe(40_000); // 40 s
+      expect(results[1].tokens).toEqual({ input: 2200, cacheRead: 5000, cacheCreate: 0, output: 300 });
+      expect(results[1].at).toBe(new Date(t2Ast).getTime());
+    });
+
+    it('substitui o resultado sintético do último turno se o resultado real do CLI chegar pelo snapshot', () => {
+      const m = new ChatModel();
+      m.apply({
+        type: 'user',
+        uuid: 'u-1',
+        timestamp: '2026-11-05T12:00:00.000Z',
+        message: { role: 'user', content: [{ type: 'text', text: 'Pergunta' }] },
+      }, { history: true });
+
+      m.apply({
+        type: 'assistant',
+        uuid: 'a-1',
+        timestamp: '2026-11-05T12:00:10.000Z',
+        message: {
+          id: 'msg-1',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Resposta' }],
+          usage: { input_tokens: 1000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 50 },
+        },
+      }, { history: true });
+
+      m.finalizePendingTurn();
+      expect(m.items.filter((it) => it.kind === 'result')).toHaveLength(1);
+      expect((m.items.find((it) => it.kind === 'result') as ResultItem).synthetic).toBe(true);
+
+      // Chega o resultado real do snapshot live com custo exato e uuid do CLI
+      m.apply({
+        type: 'result',
+        subtype: 'success',
+        uuid: 'real-cli-res-1',
+        duration_ms: 9800,
+        total_cost_usd: 0.045,
+        usage: { input_tokens: 1000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 50 },
+      }, { replay: true });
+
+      const results = m.items.filter((it) => it.kind === 'result') as ResultItem[];
+      expect(results).toHaveLength(1);
+      expect(results[0].synthetic).toBeUndefined();
+      expect(results[0].costUsd).toBe(0.045);
+      expect(results[0].durationMs).toBe(9800);
+    });
   });
 });

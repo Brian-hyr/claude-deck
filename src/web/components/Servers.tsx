@@ -19,6 +19,8 @@ import {
   toast,
   toggleFavorite,
   hostLabel,
+  installHostAgy,
+  installingAgy,
   updateHostClaude,
   updatingClaude,
   windowContext,
@@ -27,9 +29,10 @@ import type { HostInfo } from '../../shared/types';
 import { Icon } from './icons';
 import { openMenu } from './ContextMenu';
 import { tildify } from '../../shared/paths';
+import { cliAuthDialog } from './CliAuthDialog';
 
 const expandedHosts = signal<Set<string>>(new Set(['local']));
-const checkResults = signal<Record<string, { ok: boolean; ms: number; error?: string; claude?: { version: string } | null; claudeLatest?: string }>>({});
+const checkResults = signal<Record<string, { ok: boolean; ms: number; error?: string; claude?: { version: string } | null; claudeLatest?: string; agy?: { version: string } | null }>>({});
 const checking = signal(false);
 
 function stateIcon(id: string) {
@@ -127,7 +130,13 @@ function CheckTable() {
               </td>
               <td>{id}</td>
               <td style={{ color: 'var(--fg-muted)' }}>
-                {res[id].ok ? (res[id].claude ? `Claude ${res[id].claude!.version}${res[id].claudeLatest ? ` → ${res[id].claudeLatest} disponível` : ''}` : 'sem Claude') : res[id].error}
+                {res[id].ok ? (
+                  <>
+                    <span>{res[id].claude ? `Claude ${res[id].claude!.version}${res[id].claudeLatest ? ` → ${res[id].claudeLatest} disponível` : ''}` : 'sem Claude'}</span>
+                    <span style={{ margin: '0 6px', opacity: 0.4 }}>·</span>
+                    <span>{res[id].agy ? `Agy ${res[id].agy!.version}` : 'sem Agy'}</span>
+                  </>
+                ) : res[id].error}
               </td>
             </tr>
           ))}
@@ -160,6 +169,7 @@ function HostRow({ host, chats: nChats, filterQ }: { host: HostInfo; chats: numb
   const startChat = (folder?: string) => openChatIn(host.id, folder);
   const offer = claudeUpdateOffer(host.id);
   const updating = updatingClaude.value.has(host.id);
+  const isInstallingAgy = installingAgy.value.has(host.id);
   // Só o explorador desta janela mostra arquivos, e só do servidor dela: "Abrir pasta…" e
   // "Abrir no explorador" não aparecem para os outros servidores (eles têm a janela deles).
   const ctx = windowContext.value;
@@ -170,6 +180,8 @@ function HostRow({ host, chats: nChats, filterQ }: { host: HostInfo; chats: numb
       { label: 'Abrir a janela do servidor', icon: 'multiple-windows', action: () => openHostWindow(host.id) },
       { separator: true },
       { label: 'Nova conversa…', icon: 'comment-discussion', action: () => (folderBrowser.value = { hostId: host.id, purpose: 'chat' }) },
+      { label: 'Entrar no Claude Code…', icon: 'account', action: () => (cliAuthDialog.value = { hostId: host.id, engine: 'claude' }) },
+      { label: 'Entrar no Antigravity…', icon: 'account', action: () => (cliAuthDialog.value = { hostId: host.id, engine: 'antigravity' }) },
       ...(canBrowse ? [{ label: 'Abrir pasta…', icon: 'folder-opened', action: () => (folderBrowser.value = { hostId: host.id, purpose: 'workspace' as const }) }] : []),
       { separator: true },
       ...(host.kind === 'ssh'
@@ -179,13 +191,20 @@ function HostRow({ host, chats: nChats, filterQ }: { host: HostInfo; chats: numb
             ...(offer
               ? [{ label: updating ? 'Atualizando o Claude Code…' : `Atualizar Claude Code (${offer.from} → ${offer.to})…`, icon: 'arrow-circle-up', disabled: updating, action: () => void updateHostClaude(host.id) }]
               : []),
+            ...(!st?.agy
+              ? [{ label: isInstallingAgy ? 'Instalando Antigravity CLI…' : 'Instalar Antigravity CLI…', icon: isInstallingAgy ? 'loading' : 'cloud-download', disabled: isInstallingAgy, action: () => void installHostAgy(host.id) }]
+              : []),
             ...(st?.state === 'ready'
               ? [{ label: 'Desconectar', icon: 'debug-disconnect', action: () => void disconnectHost(host.id) }]
               : []),
             { separator: true },
             { label: 'Copiar comando ssh', icon: 'copy', action: () => navigator.clipboard.writeText(`ssh ${/\s/.test(host.id) ? `"${host.id}"` : host.id}`) },
           ]
-        : []),
+        : [
+            ...(!st?.agy
+              ? [{ label: isInstallingAgy ? 'Instalando Antigravity CLI…' : 'Instalar Antigravity CLI…', icon: isInstallingAgy ? 'loading' : 'cloud-download', disabled: isInstallingAgy, action: () => void installHostAgy(host.id) }]
+              : []),
+          ]),
     ]);
 
   return (
@@ -251,6 +270,20 @@ function HostRow({ host, chats: nChats, filterQ }: { host: HostInfo; chats: numb
           {st?.state === 'ready' && st.claude === null && host.kind === 'ssh' && (
             <div class="tree-empty" style={{ paddingLeft: 44, color: 'var(--warn)' }}>
               Claude Code não encontrado neste servidor.
+            </div>
+          )}
+          {st?.state === 'ready' && st.agy === null && (
+            <div class="tree-empty" style={{ paddingLeft: 44, color: 'var(--fg-muted)', display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
+              <span>Antigravity CLI não encontrado.</span>
+              <button
+                class="btn secondary"
+                style={{ height: 20, padding: '0 8px', fontSize: 11, display: 'inline-flex', alignItems: 'center', gap: 4 }}
+                disabled={isInstallingAgy}
+                onClick={(e) => (e.stopPropagation(), void installHostAgy(host.id))}
+              >
+                <Icon name={isInstallingAgy ? 'loading' : 'cloud-download'} class={isInstallingAgy ? 'spin' : ''} style={{ fontSize: 12 }} />
+                {isInstallingAgy ? 'Instalando…' : 'Instalar'}
+              </button>
             </div>
           )}
           {recent.map((f) => (

@@ -15,6 +15,7 @@ import { PromptBroker } from './prompts';
 import { HostRegistry } from './hosts/registry';
 import { SessionManager, type ClaudeSession, type TerminalBinder } from './claude/session';
 import { HistoryCache, HistoryService, UNTITLED } from './claude/history';
+import { readClaudeSettings, saveClaudeSettings } from './claude/settings';
 import { importFromVscode } from './vscode/import';
 import { formatHostBlock, listEntries, loadSshConfig } from './hosts/sshconfig';
 import { FsConflictError, looksBinary, mkdirp, sortEntries, type HostFs } from './fs/hostfs';
@@ -24,22 +25,26 @@ import { FileEditGuards } from './fs/editguards';
 import { copyPath } from './fs/copyfs';
 import { receivesSessionMsg } from './routing';
 import { WID_RE, attachWindow, contextKey, getWindowContext, migrateLegacyWindows, pruneWindows, reconcileWindowSessions, sameContext, saveWindowState } from './windows';
-import { buildOpenUrl, launchWindow, focusWindow, BROWSER_IDS, findBrowser, resolveBrowser, type BrowserSelection } from './browser';
+import { buildOpenUrl, launchWindow, focusWindow, runPlacement, validPlacement, BROWSER_IDS, findBrowser, resolveBrowser, type BrowserSelection, type PlacementResult } from './browser';
 import { TaskbarBadge, summarizeBadge } from './taskbar';
 import { readClipboardText } from './clipboard';
 import { OPEN_RE, isValidTarget, type OpenTarget } from '../shared/openwin';
 import { DeckError, type RpcRequest } from '../shared/protocol';
-import { LOCAL_HOST_ID, MAX_PINS_PER_CONVERSATION, PIN_SNIPPET_MAX, type BrowserId, type FileEntry, type ManualPendingConversation, type ReadResult, type SearchResult, type UiState } from '../shared/types';
+import { parseAutoDecisionText, parseAutoMarker, type AutoDecision } from '../shared/automodel';
+import { LOCAL_HOST_ID, MAX_PINS_PER_CONVERSATION, PIN_SNIPPET_MAX, type BrowserId, type FileEntry, type ManualPendingConversation, type ModelOption, type ReadResult, type SearchResult, type UiState, type WindowBounds } from '../shared/types';
 import { isAbsolute, relativeTo } from '../shared/paths';
 import { contentTypeFor } from './mime';
 import { TerminalManager } from './terminal/manager';
 import { TerminalAgent } from './terminal/agent';
 import { isFocusReport, isTerminalReport } from '../shared/terminalProtocol';
+import { OrqManager, orqFile } from './orq/manager';
+import { CliAuthManager } from './claude/cliAuth';
+import { listAgyModels } from './claude/agyModels';
 
 export const APP_VERSION = '1.0.0';
 const BOOT_ID = crypto.randomUUID();
 /** Métodos que uma versão anterior do servidor não tinha (ver `on`, modo de teste). */
-const OLD_SERVER_MISSING = new Set(['fs.mkdirp', 'fs.existsMany', 'dl.ticket', 'history.agent', 'sessions.stopTask', 'fileClipboard.set', 'fileClipboard.get', 'fileClipboard.clear', 'fileCopy.start', 'fileCopy.list', 'fileCopy.get', 'fileCopy.resolve', 'fileCopy.cancel', 'fileCopy.edits', 'fileCopy.ack', 'clipboard.readText', 'pins.list', 'pins.set', 'hosts.updateClaude']);
+const OLD_SERVER_MISSING = new Set(['fs.mkdirp', 'fs.existsMany', 'dl.ticket', 'history.agent', 'sessions.stopTask', 'fileClipboard.set', 'fileClipboard.get', 'fileClipboard.clear', 'fileCopy.start', 'fileCopy.list', 'fileCopy.get', 'fileCopy.resolve', 'fileCopy.cancel', 'fileCopy.edits', 'fileCopy.ack', 'clipboard.readText', 'pins.list', 'pins.set', 'hosts.updateClaude', 'claudeSettings.get', 'claudeSettings.save', 'orq.create', 'orq.list', 'orq.approve', 'orq.pause', 'orq.stopWorkers', 'orq.cancel']);
 
 export interface ServerOptions {
   port: number;
@@ -64,9 +69,12 @@ export class DeckServer {
   prompts = new PromptBroker();
   registry: HostRegistry;
   sessions: SessionManager;
+  /** Orquestrações: conversas que criam e acompanham outras conversas (workers). */
+  orq: OrqManager;
   history: HistoryService;
   historyCache: HistoryCache;
   terminalManager: TerminalManager;
+  private cliAuth: CliAuthManager;
   transfers: FileTransfers;
   private editGuards: FileEditGuards;
   token: string;
@@ -87,6 +95,11 @@ export class DeckServer {
   private pendingOpens = new Map<string, number>();
   /** Quando cada janela desconectou (para distinguir "fechei esta janela" de "fechei o app/desliguei"). */
   private closedAt = new Map<string, number>();
+  /** Janela do navegador (HWND) de cada janela do Deck no Windows: ler a posição sem marcar o título. */
+  private winHwnd = new Map<string, number>();
+  /** Leituras/aplicações de posição em fila: cada uma é um PowerShell, uma por vez. */
+  private placementChain: Promise<void> = Promise.resolve();
+  private placementTimers = new Map<string, NodeJS.Timeout>();
   private startedAt = Date.now();
   /** Desde quando cada janela está conectada sem interrupção (para saber quem "ficou aberta"). */
   private liveSince = new Map<string, number>();
@@ -124,6 +137,7 @@ export class DeckServer {
     this.token = loadOrCreateToken(paths);
     this.cookieValue = crypto.createHmac('sha256', this.token).update('deck-cookie').digest('hex');
     this.registry = new HostRegistry(this.store, this.prompts, (m) => this.log(m));
+    this.cliAuth = new CliAuthManager(this.registry);
     this.editGuards = new FileEditGuards({
       identity: (h) => this.registry.copyIdentity(h),
       platform: (h) => this.registry.get(h).platform,
@@ -167,9 +181,19 @@ export class DeckServer {
       (s) => this.readSessionTitle(s),
       (s, t) => this.writeSessionTitle(s, t),
       (s) => this.readSessionProvisionalTitle(s),
+      (h) => this.readPickerOptions(h),
+      (s, from) => this.readAutoPick(s, from),
     );
     this.terminalManager = new TerminalManager(this.registry, (m) => this.log(m));
     this.sessions.terminals = this.terminalBinder;
+    this.orq = new OrqManager({
+      sessions: this.sessions,
+      registry: this.registry,
+      file: orqFile(paths.dataDir),
+      log: (m) => this.log(m),
+      closeSession: (sid) => this.closeConversation(sid),
+    });
+    this.sessions.orq = this.orq;
     this.taskbarBadge = new TaskbarBadge({
       profileDir: path.join(paths.dataDir, 'browser-profile'),
       browser: () => this.activeBrowser,
@@ -208,6 +232,7 @@ export class DeckServer {
 
   async start(): Promise<void> {
     if (!this.opts.skipVscodeImport && !this.store.hosts.importedFromVscode) await this.importVscode().catch((e) => this.log(`importação do VS Code falhou: ${e.message}`));
+    this.orq.load();
     this.sessions.load();
     this.migrateLegacyState();
     this.reconcileSavedWindows(new Set());
@@ -239,7 +264,9 @@ export class DeckServer {
     await this.transfers.shutdown();
     if (this.wakeTimer) clearInterval(this.wakeTimer);
     this.taskbarBadge.dispose();
+    this.cliAuth.closeAll();
     this.terminalManager.closeAll();
+    this.orq.shutdown();
     this.sessions.shutdown();
     this.historyCache.flush();
     try {
@@ -302,6 +329,14 @@ export class DeckServer {
       this.broadcast('session.attention', { sid: st.sid, ...a });
       if (!this.clients.size) this.toast(st, a);
       this.taskbarBadge.touch();
+    });
+    this.orq.on('update', (view) => this.broadcast('orq.update', view));
+    // Orquestração parada com tarefas pendentes: precisa de você (mesmo aviso de "terminou" na aba do orquestrador).
+    this.orq.on('attention', ({ sid }: { sid: string }) => {
+      const s = this.sessions.sessions.get(sid);
+      if (!s) return;
+      this.broadcast('session.attention', { sid, kind: 'done', error: true, subtype: 'orq_stalled' });
+      if (!this.clients.size) this.toast(s.state, { kind: 'done' });
     });
     // `pos` = posição do pedaço desde a abertura: a interface que reabre a aba com o histórico
     // (term.replay) ignora o que já veio nele.
@@ -687,6 +722,7 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
       }
     });
     const gone = () => {
+      this.cliAuth.cancelOwner(client.id);
       if (!this.clients.delete(client) || !client.wid) return;
       const wid = client.wid;
       if (this.liveWids().has(wid)) return; // outra conexão da mesma janela continua
@@ -705,6 +741,7 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
         if (!live.has(wid)) {
           this.log(`janela: ${this.winLabel(wid)} fechada (abertas agora: ${live.size})`);
           this.liveSince.delete(wid);
+          this.winHwnd.delete(wid);
           const termHosts = this.terminalManager.list(wid).map((t) => t.hostId);
           this.terminalManager.closeForWindow(wid);
           // Conversas paradas desta janela soltam o canal: sem isso elas seguravam a conexão SSH do servidor
@@ -844,6 +881,74 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
     return ok;
   }
 
+  /** Guardar/reaplicar a posição das janelas: só no Windows, fora dos testes automáticos e sem Firefox. */
+  private placementEnabled(): boolean {
+    if (process.platform !== 'win32' || process.env.CLAUDE_DECK_TEST_HOOKS === '1') return false;
+    try {
+      return this.browserForWindow().id !== 'firefox';
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Lê onde a janela do navegador está e guarda; com `apply`, antes a põe nessa posição (janela reaberta).
+   * Usa o HWND já conhecido quando há; senão marca o título da página por um instante para achá-la.
+   * `retries`: a página recém-aberta pode ainda não ter posto a marca no título.
+   */
+  private placeWindow(wid: string, apply?: WindowBounds, retries = 0): Promise<void> {
+    const run = async (): Promise<void> => {
+      if (this.stopping) return;
+      const c = this.clientOfWid(wid);
+      if (!c) return;
+      let browser: BrowserSelection;
+      try {
+        browser = this.browserForWindow();
+      } catch {
+        return;
+      }
+      if (browser.id === 'firefox') return;
+      const known = apply ? undefined : this.winHwnd.get(wid);
+      let res: PlacementResult | null = null;
+      if (known) [res] = await runPlacement(browser.profileDir, [{ hwnd: known }], { browser });
+      if (!res) {
+        const marker = `deck-${crypto.randomBytes(6).toString('hex')}`;
+        this.sendTo(c, 'window.mark', { marker });
+        try {
+          await new Promise((r) => setTimeout(r, 300));
+          [res] = await runPlacement(browser.profileDir, [{ marker, apply }], { browser });
+        } finally {
+          this.sendTo(c, 'window.unmark', { marker });
+        }
+      }
+      if (!res) {
+        this.winHwnd.delete(wid);
+        if (retries > 0) setTimeout(() => void this.placeWindow(wid, apply, retries - 1), 1500).unref();
+        else if (apply) this.log(`janela: ${this.winLabel(wid)} — não achei a janela do navegador para pôr na posição salva`);
+        return;
+      }
+      this.winHwnd.set(wid, res.hwnd);
+      const p = res.placement;
+      const where = `${p.x},${p.y} ${p.width}x${p.height}${p.maximized ? ' maximizada' : ''}`;
+      if (apply) this.log(`janela: ${this.winLabel(wid)} reposta na posição salva (${res.result}; agora ${where})`);
+      // Lugar salvo num monitor que não existe mais: a janela ficou onde o navegador abriu, mas a posição
+      // salva continua valendo até o usuário mexer na janela (o monitor pode voltar).
+      if (res.result !== 'OFF') this.storePlacement(wid, p);
+    };
+    const next = this.placementChain.then(run).catch((e) => this.log(`posição da janela: ${(e as Error)?.message ?? e}`));
+    this.placementChain = next;
+    return next;
+  }
+
+  private storePlacement(wid: string, p: WindowBounds): void {
+    const rec = this.store.windows[wid];
+    if (!rec) return;
+    const old = rec.placement;
+    if (old && old.x === p.x && old.y === p.y && old.width === p.width && old.height === p.height && !!old.maximized === !!p.maximized) return;
+    rec.placement = p;
+    this.store.saveWindows();
+  }
+
   /** Abre a janela de um servidor+pasta no navegador selecionado (sem duplicar cliques). */
   private launchTarget(target: OpenTarget): { launched: boolean; url?: string; pending?: boolean } {
     const key = contextKey(target.h, target.f ?? '~');
@@ -895,6 +1000,47 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
     this.handlers.set(method, h);
   }
 
+  /**
+   * Uma janela = um servidor + uma pasta: conversa nova nesta janela precisa ser do contexto dela (ou, sem contexto
+   * ainda, passa a defini-lo). Lembra a pasta nas recentes do servidor.
+   */
+  private claimWindowContext(client: Client, hostId: string, cwd: unknown) {
+    const win = client.wid ? this.store.windows[client.wid] : undefined;
+    if (win && typeof cwd === 'string' && cwd) {
+      const ctx = getWindowContext(win);
+      if (ctx && !sameContext(ctx.hostId, ctx.cwd, hostId, cwd))
+        throw new DeckError('otherwindow', `Esta janela é de ${ctx.hostId === LOCAL_HOST_ID ? 'Este computador' : ctx.hostId} em ${ctx.cwd}; ${cwd} abre na janela dessa pasta.`);
+      if (!ctx) {
+        const owner = this.contextOwner(hostId, cwd, client.wid);
+        if (owner) throw new DeckError('otherwindow', `${cwd} já tem a janela dela.`);
+        win.hostId = hostId;
+        win.contextCwd = cwd;
+        win.shouldRestore = true;
+        this.store.saveWindows();
+      }
+    }
+    if (typeof cwd === 'string' && cwd) this.store.addRecentFolder(hostId, cwd);
+    // As outras janelas também veem a pasta nova entre as recentes (aba Servidores).
+    this.broadcast('hosts.update', this.registry.list());
+  }
+
+  /** Fecha uma conversa como o botão da aba: encerra o processo, tira a aba do estado salvo e avisa as janelas. */
+  private async closeConversation(sid: string) {
+    const hostId = this.sessions.sessions.get(sid)?.state.hostId;
+    await this.sessions.close(sid);
+    // A aba fechada sai também do estado salvo da janela (a interface pode ter gravado antes).
+    let changed = false;
+    for (const w of Object.values(this.store.windows)) {
+      const n = w.state.chatTabs.length;
+      w.state.chatTabs = w.state.chatTabs.filter((t) => t.sid !== sid);
+      if (w.state.chatTabs.length !== n) changed = true;
+    }
+    if (changed) this.store.saveWindows();
+    // Fechada pelo servidor (orquestrador): a interface tira a aba (quem fechou pelo botão já tirou).
+    this.broadcast('session.closed', { sid });
+    this.releaseHostSoon(hostId);
+  }
+
   private async fsFor(hostId: string) {
     const host = this.registry.get(hostId);
     if (hostId !== LOCAL_HOST_ID) await this.registry.connect(hostId);
@@ -930,6 +1076,41 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
       if (current !== hostId) throw new DeckError('otherwindow', 'O destino/origem precisa ser o servidor desta janela.');
     }
     return client.wid;
+  }
+
+  /** `modelPicker.options` do ~/.claude/settings.json do servidor; erro/ausência = lista vazia. */
+  private async readPickerOptions(hostId: string): Promise<ModelOption[]> {
+    const local = hostId === LOCAL_HOST_ID;
+    const dir = local && process.env.CLAUDE_CONFIG_DIR ? process.env.CLAUDE_CONFIG_DIR : `${await this.homeOf(hostId)}/.claude`;
+    const host = await this.fsFor(hostId);
+    let json: any;
+    try {
+      const { data, truncated } = await host.fs.read(`${dir}/settings.json`, 2 * 1024 * 1024);
+      if (truncated) return [];
+      json = JSON.parse(data.toString('utf8').replace(/^﻿/, ''));
+    } catch {
+      return [];
+    }
+    const opts = json?.modelPicker?.options;
+    const baseList: ModelOption[] = [
+      { value: 'flash38[1m]', displayName: 'Gemini 3.8 Flash (1M)', description: 'Ultra rápido e alta inteligência (Gemini)' },
+      { value: 'flashlite35[1m]', displayName: 'Gemini 3.5 Flash Lite (1M)', description: 'Ultra rápido e grande contexto (Gemini)' },
+      { value: 'sonnet55[1m]', displayName: 'Sonnet 5.5 (1M)', description: 'Sonnet mais novo, equilíbrio em código e cota (Claude)' },
+      { value: 'claude-opus-5-5[1m]', displayName: 'Claude Opus 5.5 (1M)', description: 'Raciocínio máximo para tarefas críticas (Claude)' },
+    ];
+    if (!Array.isArray(opts)) return baseList;
+    const parsed: ModelOption[] = opts
+      .filter((o: any) => o && typeof o.model === 'string' && o.model.trim())
+      .map((o: any) => ({
+        value: o.model.trim(),
+        displayName: typeof o.label === 'string' && o.label.trim() ? o.label.trim() : o.model.trim(),
+        description: typeof o.description === 'string' ? o.description : undefined,
+      }));
+    const have = new Set(parsed.map((p) => p.value));
+    for (const b of baseList) {
+      if (!have.has(b.value)) parsed.push(b);
+    }
+    return parsed;
   }
 
   private async homeOf(hostId: string): Promise<string> {
@@ -1021,6 +1202,40 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
     return true;
   }
 
+  /**
+   * Escolha do gateway para uma conversa no modo automático. O hook grava `~/.cache/cc-auto/<sessionId>` ao
+   * decidir (apagado depois de 14 dias); o aviso que ele injeta no 1º pedido fica no transcript para sempre.
+   */
+  private async readAutoPick(s: ClaudeSession, transcriptFrom: number): Promise<{ pick: AutoDecision | null; scannedTo?: number }> {
+    const sessionId = s.state.sessionId;
+    if (!sessionId) return { pick: null };
+    const host = await this.fsFor(s.state.hostId);
+    const home = await this.homeOf(s.state.hostId);
+    const sep = host.platform === 'win32' ? '\\' : '/';
+    const marker = [home.replace(/[\\/]+$/, ''), '.cache', 'cc-auto', sessionId].join(sep);
+    try {
+      const found = parseAutoMarker((await host.fs.read(marker, 16_384)).data.toString('utf8'));
+      if (found) return { pick: found };
+    } catch {
+      /* hook ainda não decidiu, ou o arquivo já expirou */
+    }
+    const file = await this.history.findFile(host, home, sessionId, s.state.cwd);
+    if (!file) return { pick: null };
+    // Só o aviso do próprio hook (anexo da sessão principal), não uma mensagem que cite o mesmo texto.
+    const hookText = (line: string): string => {
+      try {
+        const o = JSON.parse(line);
+        const a = o?.type === 'attachment' && !o.isSidechain ? o.attachment : undefined;
+        if (a?.type !== 'hook_additional_context') return '';
+        return Array.isArray(a.content) ? a.content.join(' ') : typeof a.content === 'string' ? a.content : '';
+      } catch {
+        return '';
+      }
+    };
+    const r = await this.history.findFirstLine(host, file, 'gateway escolheu', (l) => !!parseAutoDecisionText(hookText(l)), transcriptFrom);
+    return { pick: r.line ? parseAutoDecisionText(hookText(r.line)) : null, scannedTo: r.scannedTo };
+  }
+
   private registerHandlers() {
     // --- app
     this.on('app.info', () => ({
@@ -1035,6 +1250,8 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
       manualPending: true,
       // Mensagens fixadas (marcador de leitura): `pins.list` / `pins.set`. Interface nova com servidor antigo avisa.
       pins: this.handlers.has('pins.set'),
+      // Orquestrador (conversa que cria e acompanha outras): `orq.*`. Interface nova com servidor antigo esconde o botão.
+      orchestrator: this.handlers.has('orq.create'),
       browserSelection: true,
       browser: (() => { try { return resolveBrowser(this.opts.paths.dataDir).id; } catch { return null; } })(),
       bootId: BOOT_ID,
@@ -1102,6 +1319,30 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
       return roots;
     });
     this.on('settings.set', (p) => this.store.setSettings(p ?? {}));
+    // --- Claude Code settings.json
+    this.on('claudeSettings.get', async (p) => {
+      const hostId = this.pendingHostId(p?.hostId);
+      const host = await this.fsFor(hostId);
+      const home = await this.homeOf(hostId);
+      return readClaudeSettings(host, home, hostId, p?.scope ?? 'user', p?.cwd);
+    });
+    this.on('claudeSettings.save', async (p) => {
+      const hostId = this.pendingHostId(p?.hostId);
+      const host = await this.fsFor(hostId);
+      const home = await this.homeOf(hostId);
+      const res = await saveClaudeSettings(host, home, hostId, p ?? {});
+      if (p?.scope === 'user') {
+        void this.readPickerOptions(hostId).then((extra) => {
+          const curCaps = this.sessions.caps.get(hostId);
+          if (curCaps) {
+            const have = new Set(curCaps.models.map((m) => m.value));
+            const missing = extra.filter((m) => !have.has(m.value));
+            if (missing.length) this.sessions.setCaps(hostId, { ...curCaps, models: [...curCaps.models, ...missing] });
+          }
+        }).catch(() => {});
+      }
+      return res;
+    });
     // Janelas: uma por servidor+pasta das conversas, cada uma com o seu estado de tela.
     this.on('window.attach', async ({ wid, target }, client) => {
       const open = target === undefined ? undefined : isValidTarget(target) && this.registry.exists(target.h) ? (target as OpenTarget) : null;
@@ -1146,6 +1387,13 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
       this.log(`janela: ${this.winLabel(r.wid)} conectou (${how}; abertas agora: ${this.liveWids().size})`);
       pruneWindows(this.store.windows, this.liveWids(), this.sessionWids());
       this.store.saveWindows();
+      // Posição na tela (Windows): uma janela do navegador recém-aberta volta para onde esta janela estava;
+      // a mesma aba reconectando (F5, servidor reiniciado) só é lida, para o servidor conhecer a janela.
+      if (this.placementEnabled()) {
+        const sameTab = known === r.wid && !freshId;
+        const saved = sameTab ? undefined : validPlacement(rec.placement);
+        setTimeout(() => void this.placeWindow(r.wid, saved, 2), 700).unref();
+      }
       // Primeira janela com o app todo fechado (sem id salvo, sem destino, nenhuma outra aberta): reabre as
       // outras que estavam abertas. Vale depois de ligar o PC E quando o programa em segundo plano continuou
       // rodando e o usuário fechou todas as janelas e clicou no atalho (antes só valia no primeiro caso).
@@ -1157,6 +1405,20 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
         }, 2500).unref();
       }
       return { wid: r.wid, state: r.state, context: getWindowContext(rec) ?? null };
+    });
+    // A página notou que a janela mudou de lugar/tamanho: o servidor lê a posição real (pixels físicos).
+    this.on('window.placement', (_p, client) => {
+      const wid = client.wid;
+      if (!wid || !this.placementEnabled()) return false;
+      clearTimeout(this.placementTimers.get(wid));
+      this.placementTimers.set(
+        wid,
+        setTimeout(() => {
+          this.placementTimers.delete(wid);
+          void this.placeWindow(wid);
+        }, 300).unref(),
+      );
+      return true;
     });
     this.on('state.set', (p, client) => {
       const win = client.wid ? this.store.windows[client.wid] : undefined;
@@ -1270,6 +1532,8 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
     this.on('hosts.check', ({ id }) => this.registry.check(id));
     // Atualiza o Claude Code do servidor (`claude update` lá). Só roda quando o usuário clica e confirma.
     this.on('hosts.updateClaude', ({ id }) => this.registry.updateClaude(String(id)));
+    // Instala o Antigravity CLI no servidor (ou localmente).
+    this.on('hosts.installAgy', ({ id }) => this.registry.installAgy(String(id)));
     // Só nos testes automáticos (variável de ambiente): simula a queda da rede com um servidor.
     if (process.env.CLAUDE_DECK_TEST_HOOKS === '1') {
       this.on('test.dropHost', ({ id }) => {
@@ -1278,6 +1542,14 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
       });
     }
     this.on('auth.respond', ({ promptId, ok, values }) => this.prompts.respond(promptId, ok ? { ok: true, values: values ?? [] } : { ok: false }));
+    // Login das CLIs é privado da conexão que o iniciou; nunca vira terminal ou evento broadcast.
+    this.on('cliAuth.start', ({ hostId, engine }, client) => {
+      if (!client.wid) throw new DeckError('bad', 'Anexe a janela antes de iniciar o login.');
+      return this.cliAuth.start(client.id, hostId, engine);
+    });
+    this.on('cliAuth.status', ({ id }, client) => this.cliAuth.status(client.id, id));
+    this.on('cliAuth.submit', ({ id, code }, client) => this.cliAuth.submit(client.id, id, code));
+    this.on('cliAuth.cancel', ({ id }, client) => this.cliAuth.cancel(client.id, id));
 
     // --- clipboard e cópias entre janelas (nunca transporta bytes no RPC)
     this.on('fileClipboard.get', (_p, c) => { this.copyWindow(c); return this.transfers.clipboard; });
@@ -1451,22 +1723,7 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
           throw new DeckError('alreadyopen', 'Esta conversa já está aberta em outra janela.');
         }
       }
-      if (win && typeof p.cwd === 'string' && p.cwd) {
-        const ctx = getWindowContext(win);
-        if (ctx && !sameContext(ctx.hostId, ctx.cwd, p.hostId, p.cwd))
-          throw new DeckError('otherwindow', `Esta janela é de ${ctx.hostId === LOCAL_HOST_ID ? 'Este computador' : ctx.hostId} em ${ctx.cwd}; ${p.cwd} abre na janela dessa pasta.`);
-        if (!ctx) {
-          const owner = this.contextOwner(p.hostId, p.cwd, client.wid);
-          if (owner) throw new DeckError('otherwindow', `${p.cwd} já tem a janela dela.`);
-          win.hostId = p.hostId;
-          win.contextCwd = p.cwd;
-          win.shouldRestore = true;
-          this.store.saveWindows();
-        }
-      }
-      this.store.addRecentFolder(p.hostId, p.cwd);
-      // As outras janelas também veem a pasta nova entre as recentes (aba Servidores).
-      this.broadcast('hosts.update', this.registry.list());
+      this.claimWindowContext(client, p.hostId, p.cwd);
       const s = this.sessions.create({ ...p, wid: client.wid });
       return s.state;
     });
@@ -1493,6 +1750,8 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
       const s = this.sessions.get(sid);
       if (s.state.executionMode === 'terminal' && s.state.wid !== client.wid) throw new DeckError('otherwindow', 'Esta conversa pertence a outra janela.');
       await s.send(content, uuid);
+      // Mensagem digitada ao orquestrador: ele volta a ser acompanhado (sai de "esperando você"/"parado").
+      if (s.state.orq?.role === 'orchestrator') this.orq.onUserMessage(sid);
       return true;
     });
     this.on('sessions.respond', ({ sid, requestId, response }, client) => {
@@ -1515,8 +1774,16 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
       await this.sessions.get(sid).setPermissionMode(mode);
       return true;
     });
+    this.on('sessions.setAutoApprove', ({ sid, on }) => {
+      this.sessions.get(sid).setAutoApprove(!!on);
+      return true;
+    });
     this.on('sessions.setModel', async ({ sid, model }) => {
       await this.sessions.get(sid).setModel(model || null);
+      return true;
+    });
+    this.on('sessions.setEngine', ({ sid, engine }) => {
+      this.sessions.get(sid).setEngine(engine === 'antigravity' ? 'antigravity' : 'claude');
       return true;
     });
     this.on('sessions.setEffort', async ({ sid, effort }, client) => {
@@ -1546,20 +1813,71 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
       return true;
     });
     this.on('sessions.close', async ({ sid }) => {
-      const hostId = this.sessions.sessions.get(sid)?.state.hostId;
-      await this.sessions.close(sid);
-      // A aba fechada sai também do estado salvo da janela (a interface pode ter gravado antes).
-      let changed = false;
-      for (const w of Object.values(this.store.windows)) {
-        const n = w.state.chatTabs.length;
-        w.state.chatTabs = w.state.chatTabs.filter((t) => t.sid !== sid);
-        if (w.state.chatTabs.length !== n) changed = true;
-      }
-      if (changed) this.store.saveWindows();
-      this.releaseHostSoon(hostId);
+      await this.closeConversation(sid);
       return true;
     });
     this.on('sessions.caps', ({ hostId }) => this.sessions.caps.get(hostId) ?? null);
+    this.on('sessions.agyModels', ({ hostId }) => listAgyModels(this.registry, hostId));
+
+    // --- orquestrador: uma conversa que divide o trabalho e cria/acompanha conversas (workers) na mesma janela
+    this.on('orq.create', async (p, client) => {
+      if (!client.wid) throw new DeckError('otherwindow', 'A janela precisa estar anexada antes de criar um orquestrador.');
+      if (typeof p?.hostId !== 'string' || !this.registry.exists(p.hostId)) throw new DeckError('nohost', 'Servidor desconhecido.');
+      if (typeof p.cwd !== 'string' || !p.cwd) throw new DeckError('bad', 'Pasta inválida.');
+      const opts = {
+        hostId: p.hostId,
+        cwd: p.cwd,
+        wid: client.wid,
+        goal: typeof p.goal === 'string' ? p.goal : undefined,
+        title: typeof p.title === 'string' ? p.title : undefined,
+        workerPermissionMode: p.workerPermissionMode,
+        maxParallel: p.maxParallel,
+        requireApproval: p.requireApproval !== false,
+        model: typeof p.model === 'string' && p.model ? p.model : undefined,
+        effort: p.effort,
+        workerModel: typeof p.workerModel === 'string' && p.workerModel ? p.workerModel : undefined,
+        orchestratorPermissionMode: p.permissionMode,
+      };
+      // Opções inválidas não podem deixar a janela presa a uma pasta.
+      this.orq.checkCreate(opts);
+      this.claimWindowContext(client, p.hostId, p.cwd);
+      const r = await this.orq.create(opts);
+      return { orchestration: r.view, state: this.sessions.get(r.sid).state };
+    });
+    /** Orquestrações desta janela (ou da pasta dela). Abrir a janela entrega o que ficou pendente. */
+    this.on('orq.list', (_p, client) => {
+      const win = client.wid ? this.store.windows[client.wid] : undefined;
+      const ctx = win ? getWindowContext(win) : undefined;
+      const mine = this.orq.list().filter((o) => o.wid === client.wid || (ctx && sameContext(ctx.hostId, ctx.cwd, o.hostId, o.cwd)));
+      for (const o of mine) this.orq.kick(o.id);
+      return mine;
+    });
+    const ownOrq = (id: unknown, client: Client) => {
+      if (typeof id !== 'string') throw new DeckError('bad', 'Orquestração inválida.');
+      const o = this.orq.get(id);
+      const wid = this.orq.view(o).wid;
+      if (wid && wid !== client.wid) throw new DeckError('otherwindow', 'Esta orquestração pertence a outra janela.');
+      return o;
+    };
+    this.on('orq.approve', ({ id }, client) => {
+      ownOrq(id, client);
+      this.orq.approve(id);
+      return true;
+    });
+    this.on('orq.pause', ({ id, paused }, client) => {
+      ownOrq(id, client);
+      this.orq.setPaused(id, paused !== false);
+      return true;
+    });
+    this.on('orq.stopWorkers', async ({ id }, client) => {
+      ownOrq(id, client);
+      return this.orq.stopWorkers(id);
+    });
+    this.on('orq.cancel', async ({ id }, client) => {
+      ownOrq(id, client);
+      await this.orq.cancel(id);
+      return true;
+    });
 
     // --- pendências manuais
     this.on('pending.list', ({ hostId }) => this.store.listManualPending(this.pendingHostId(hostId)));
